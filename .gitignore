@@ -1,0 +1,37 @@
+# Editor and agent state
+.idea/
+.vscode/
+.codex/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Local credentials and runtime data
+config/decision_provider.json
+config/.decision_provider.json.*.tmp
+.env
+.env.*
+logs/
+outputs/
+recordings/
+*.log
+*.jsonl
+
+# Archives and build output
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.rar
+dist/
+build/
