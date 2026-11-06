@@ -61,7 +61,7 @@ def build(version, ref, output):
     notes = files['docs/releases/'+version+'.md']
     required = {'README.md', 'README.en.md', 'LICENSE', 'requirements-native.lock.txt',
                 'configure_install.py', 'configure_model.py', 'launch_game.py', 'manage_stack.py',
-                'game-card-enum.json', 'dsh-host/package-lock.json', 'docs/media/local-gameplay.gif'}
+                'game-card-enum.json', 'tests/fixtures/native-movement-samples.json', 'dsh-host/package-lock.json', 'docs/media/local-gameplay.gif'}
     if not required.issubset(files): raise ValueError('Missing product files')
     output = Path(output).resolve()
     if output == ROOT or not output.is_relative_to(ROOT/'artifacts'):

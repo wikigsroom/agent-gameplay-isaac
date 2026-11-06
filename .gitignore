@@ -21,13 +21,13 @@ config/decision_provider.json
 dsh-host/runtime.json
 dsh-host/isaac.patch.json
 # Game process identity, IPC and generated native bundle
-native-*.json
-native-request.lock
-native-controller.lua
-strategy-process.json
-.stack-operation.lock
-*-process.json
-latest-*.json
+/native-*.json
+/native-request.lock
+/native-controller.lua
+/strategy-process.json
+/.stack-operation.lock
+/*-process.json
+/latest-*.json
 # Never publish saves, backups, raw sessions or captured telemetry
 *.dat
 *.vdf
