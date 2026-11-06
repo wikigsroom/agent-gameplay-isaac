@@ -1,5 +1,7 @@
 # Agent Gameplay · Isaac
 
+[Final release v0.1.0](https://github.com/wikigsroom/agent-gameplay-isaac/releases/tag/v0.1.0) · [Release notes](docs/releases/v0.1.0.md)
+
 **Native Windows automation for The Binding of Isaac: Repentance. Local code handles real-time control; one agent in DSH handles strategic choices that can tolerate deliberation.**
 
 [中文](README.md) · [Documentation](docs/README.md) · [Architecture](docs/ARCHITECTURE.md) · [Capabilities](docs/CAPABILITIES.md) · [Validation](docs/VALIDATION.md) · [Operations](docs/OPERATIONS.md)

@@ -12,6 +12,7 @@
 | 已完成修复与后续 TODO / Completed fixes and remaining work | [ROADMAP.md](ROADMAP.md) |
 | 截图、视频、GIF 来源 / Media provenance | [media/README.md](media/README.md) |
 | 可机器读取的脱敏证据 / Sanitized machine-readable evidence | [evidence/audit-2026-11-07.json](evidence/audit-2026-11-07.json) |
+| 正式版发布与校验 / Final release | [RELEASING.md](RELEASING.md) |
 | 插件安装、工具与宿主 / Plugin and host | [Isaac plugin](../dsh-host/isaac-plugin/README.md) |
 
 这些文档描述 native130-dsh 当前实现。历史上游说明不构成新的操作授权；新增机器必须重新配置真实存档与进程身份。

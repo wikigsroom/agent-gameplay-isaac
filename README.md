@@ -1,5 +1,7 @@
 # Agent Gameplay · Isaac
 
+[正式版 v0.1.0](https://github.com/wikigsroom/agent-gameplay-isaac/releases/tag/v0.1.0) · [发布说明](docs/releases/v0.1.0.md)
+
 **以撒 Repentance 的原生 Windows 自动游玩系统：本地负责实时控制，DSH 中的单个 agent 负责慢速策略选择。**
 
 [English](README.en.md) · [文档导航](docs/README.md) · [架构与接口](docs/ARCHITECTURE.md) · [能力边界](docs/CAPABILITIES.md) · [验证与证据](docs/VALIDATION.md) · [操作与排障](docs/OPERATIONS.md)
