@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 3
-PROVIDERS = {"laya", "jev", "bocha", "systemone", "local"}
+PROVIDERS = {"jev", "bocha", "systemone", "local"}
 _SECRET_KEYS = {"apikey", "authorization", "typesafeapikey", "token", "accesstoken"}
 
 
@@ -320,7 +320,7 @@ class IncrementalStatistics:
             group = self._group(key)
             group["decision_count"] += 1
             provider = key[1].lower()
-            if _truthy(record, "remote_call") or provider in {"laya", "jev", "bocha", "systemone"}:
+            if _truthy(record, "remote_call") or provider in {"jev", "bocha", "systemone"}:
                 group["remote_calls"] += 1
             status = str(record.get("status", "")).lower()
             error = str(record.get("error", "")).lower()

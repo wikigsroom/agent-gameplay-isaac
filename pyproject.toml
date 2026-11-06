@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "isaac-jev"
 version = "0.1.0"
-description = "Repentance-only local Jev autopilot controller for The Binding of Isaac"
+description = "Repentance 1.7.9b local real-time control with a bounded DSH strategic agent"
 requires-python = ">=3.11"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -22,3 +22,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.setuptools.package-data]
+isaac_jev = ["strategy_dashboard.html"]

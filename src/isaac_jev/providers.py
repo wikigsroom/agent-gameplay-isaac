@@ -26,7 +26,7 @@ from .models import Action, GameState, Vec2
 from .tuning import PolicyProfile
 
 
-PROVIDER_NAMES = frozenset({"laya", "jev", "bocha", "systemone", "local"})
+PROVIDER_NAMES = frozenset({"jev", "bocha", "systemone", "local"})
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "decision_provider.json"
 LEGACY_CONFIG_PATH = PROJECT_ROOT / "logs" / "decision_provider.json"
@@ -48,14 +48,6 @@ class ProviderSettings:
 def default_provider_settings(environ: Mapping[str, str] | None = None) -> dict[str, ProviderSettings]:
     environment = os.environ if environ is None else environ
     return {
-        "laya": ProviderSettings(
-            url="http://127.0.0.1:8000/v1/decision",
-            health_url="http://127.0.0.1:8000/health",
-            model="laya-rl-agent",
-            timeout_seconds=0.75,
-            confidence_threshold=0.50,
-            auth_required=False,
-        ),
         "jev": ProviderSettings(
             url=environment.get("JEV_API_URL", "https://api.typesafe.ai/v1/systemone"),
             model=environment.get("JEV_MODEL", "jev-latest"),
@@ -203,7 +195,7 @@ def parse_provider_config(raw: Any, environ: Mapping[str, str] | None = None) ->
 
 def _provider_name(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or value not in PROVIDER_NAMES:
-        raise ProviderConfigError(f"{field_name} must be one of: jev, bocha, systemone, laya, local")
+        raise ProviderConfigError(f"{field_name} must be one of: jev, bocha, systemone, local")
     return value
 
 
@@ -551,10 +543,6 @@ class RemoteDecisionProvider:
             )
 
 
-class LayaProvider(RemoteDecisionProvider):
-    name = "laya"
-
-
 class JevProvider(RemoteDecisionProvider):
     name = "jev"
     requires_api_key = True
@@ -765,8 +753,6 @@ def create_provider(
     settings = config.providers[name]
     if name == "local":
         return LocalProvider(settings, profile)
-    if name == "laya":
-        return LayaProvider(settings, profile=profile, opener=opener)
     if name == "bocha":
         return BochaProvider(settings, api_key=settings.api_key, profile=profile, opener=opener)
     if name == "systemone":

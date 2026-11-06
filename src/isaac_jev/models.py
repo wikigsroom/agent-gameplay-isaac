@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-MECHANICAL_TRAP_ENTITY_TYPES = frozenset({42, 44, 201, 202, 218})
+MECHANICAL_TRAP_ENTITY_TYPES = frozenset({42, 44, 201, 202, 203, 212, 218, 235, 236})
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,7 @@ class Entity:
     # Lua reports the room grid cell for entities. Keep this at the end so
     # existing positional Entity(...) construction remains compatible.
     grid_index: int = -1
+    vulnerable: bool | None = None
     @classmethod
     def from_value(cls, value: Any) -> "Entity":
         if not isinstance(value, dict):
@@ -57,12 +58,38 @@ class Entity:
             str(value.get("telegraph", "") or ""),
             bool(value.get("is_boss", False)),
             int(value.get("grid_index", -1) or -1),
+            value.get("vulnerable") if isinstance(value.get("vulnerable"), bool) else None,
         )
 
 
+def projectile_closest_approach(player: Entity, projectile: Entity, horizon: float = 24.0) -> tuple[float, float]:
+    """Minimum relative separation over a bounded straight-line forecast.
+
+    Native per-frame avoidance still checks the actual movement path and bodies.
+    This macro-level test prevents receding/parallel trap fire from permanently
+    interrupting a pressure-plate route merely because it is nearby.
+    """
+    dx,dy=projectile.position.x-player.position.x,projectile.position.y-player.position.y
+    vx,vy=projectile.velocity.x-player.velocity.x,projectile.velocity.y-player.velocity.y
+    speed_sq=vx*vx+vy*vy
+    tick=max(0.0,min(horizon,-(dx*vx+dy*vy)/speed_sq)) if speed_sq>.001 else 0.0
+    return ((dx+vx*tick)**2+(dy+vy*tick)**2)**.5,tick
+
+
+def projectile_is_imminent(player: Entity, projectile: Entity) -> bool:
+    closest,tick=projectile_closest_approach(player,projectile,float('inf'))
+    # Closing on a nearby bullet also shortens the collision time when the
+    # planner starts moving. Reserve that forward lane before approaching.
+    return closest<=40.0 and (player.position.distance_to(projectile.position)<=200.0 or tick<=24.0)
+
+
 def is_mechanical_trap_entity(entity: Entity) -> bool:
-    """Exclude invulnerable room machinery from combat targets."""
-    return entity.kind in MECHANICAL_TRAP_ENTITY_TYPES
+    """Exclude room machinery and noncombat boss attachments from targets."""
+    return ((entity.kind in MECHANICAL_TRAP_ENTITY_TYPES
+             and (entity.kind != 212 or entity.variant <= 0))
+            or (entity.kind == 68 and entity.variant == 10)
+            or (entity.kind == 79 and entity.variant == 20)
+            or (entity.kind == 216 and entity.variant == 10))
 
 
 @dataclass(frozen=True)
@@ -204,6 +231,7 @@ class GridEvent:
     active: bool = False
     triggered: bool = False
     entity_id: int = -1
+    timed: bool = False
 
     @classmethod
     def from_value(cls, value: Any) -> "GridEvent":
@@ -214,6 +242,7 @@ class GridEvent:
             bool(value.get("active", False)),
             bool(value.get("triggered", False)),
             int(value.get("id", -1)),
+            bool(value.get("timed", False)),
         )
 
 
@@ -245,6 +274,7 @@ class RoomLayout:
     danger_grid_indices: frozenset[int] = frozenset()
     grid_events: tuple[GridEvent, ...] = ()
     bomb_walls: tuple[BombWall, ...] = ()
+    shot_blocked: frozenset[int] | None = None
 
     @classmethod
     def from_value(cls, value: Any) -> "RoomLayout":
@@ -258,6 +288,7 @@ class RoomLayout:
             frozenset(int(item) for item in value.get("danger_grid_indices", []) if isinstance(item, int)),
             tuple(GridEvent.from_value(item) for item in value.get("grid_events", []) if isinstance(item, dict)),
             tuple(BombWall.from_value(item) for item in value.get("bomb_walls", []) if isinstance(item, dict)),
+            frozenset(int(item) for item in value["shot_blocked"]) if isinstance(value.get("shot_blocked"), list) else None,
         )
 
 
@@ -295,6 +326,7 @@ class GameState:
     pickups: tuple[Pickup, ...] = ()
     hazards: tuple[Hazard, ...] = ()
     danger_effects: tuple[DangerEffect, ...] = ()
+    floor_danger_effects: tuple[DangerEffect, ...] = ()
     hazards_observation_valid: bool = True
     coins: int = 0
     keys: int = 0
@@ -340,6 +372,7 @@ class GameState:
     boss_exit_position: Vec2 = Vec2()
     boss_exit_grid_index: int = -1
     start_seed: int = 0
+    progression_target: str = ""
     room_visit_sequence: int = 0
     room_entered_frame: int = -1
     room_cleared_frame: int = -1
@@ -355,6 +388,7 @@ class GameState:
     held_trinkets: tuple[int, ...] = ()
     trinket_slots: int = 1
     held_pills: tuple[tuple[int, int], ...] = ()
+    held_cards: tuple[tuple[int, int], ...] = ()
     pill_use_result: str = "idle"
     trinket_swap_result: str = "idle"
     mod_version: str = "unknown"
@@ -396,7 +430,12 @@ class GameState:
             danger_effects=tuple(
                 DangerEffect.from_value(item)
                 for item in message.get("danger_effects", [])
-                if isinstance(item, dict) and str(item.get("kind", "")) == "ghost_bomb"
+                if isinstance(item, dict) and str(item.get("kind", "")) in {"ghost_bomb", "armed_bomb"}
+            ),
+            floor_danger_effects=tuple(
+                DangerEffect.from_value(item)
+                for item in message.get("danger_effects", [])
+                if isinstance(item, dict) and str(item.get("kind", "")) not in {"ghost_bomb", "armed_bomb"}
             ),
             hazards_observation_valid=bool(message.get("hazards_observation_valid", True)),
             coins=int(message.get("coins", 0)),
@@ -405,6 +444,7 @@ class GameState:
             held_trinkets=tuple(int(item) for item in message.get("held_trinkets", []) if isinstance(item, int)),
             trinket_slots=int(message.get("trinket_slots", 1) or 1),
             held_pills=tuple((int(item.get("slot", 0)), int(item.get("color", 0))) for item in message.get("held_pills", []) if isinstance(item, dict)),
+            held_cards=tuple((int(item.get("slot", 0)), int(item.get("card", 0))) for item in message.get("held_cards", []) if isinstance(item, dict)),
             pill_use_result=str(message.get("pill_use_result", "idle")),
             trinket_swap_result=str(message.get("trinket_swap_result", "idle")),
             mod_version=str(message.get("mod_version", "unknown")),
@@ -465,6 +505,7 @@ class GameState:
             boss_exit_position=Vec2.from_value(message.get("boss_exit_position")),
             boss_exit_grid_index=int(message.get("boss_exit_grid_index", -1) or -1),
             start_seed=int(message.get("start_seed", 0) or 0),
+            progression_target=str(message.get("progression_target", "") or ""),
             room_visit_sequence=int(message.get("room_visit_sequence", 0) or 0),
             room_entered_frame=int(message.get("room_entered_frame", -1) if message.get("room_entered_frame") is not None else -1),
             room_cleared_frame=int(message.get("room_cleared_frame", -1) if message.get("room_cleared_frame") is not None else -1),
@@ -499,6 +540,7 @@ class GameState:
                 "velocity": {"x": round(entity.velocity.x, 1), "y": round(entity.velocity.y, 1)},
                 "hp": round(entity.hit_points, 1),
                 "is_boss": entity.is_boss,
+                "vulnerable": entity.vulnerable,
             }
 
         close_enemies = sorted(self.enemies, key=lambda item: item.position.distance_to(self.player.position))[:8]
@@ -530,6 +572,7 @@ class GameState:
             "resources": {"coins": self.coins, "keys": self.keys, "bombs": self.bombs,
                           "held_trinkets": list(self.held_trinkets), "trinket_slots": self.trinket_slots,
                           "held_pills": [{"slot": slot, "color": color} for slot, color in self.held_pills],
+                          "held_cards": [{"slot": slot, "card": card} for slot, card in self.held_cards],
                           "pill_use_result": self.pill_use_result,
                           "trinket_swap_result": self.trinket_swap_result},
             "pickups": [{"id": item.entity_id, "name": item.name, "kind": item.pickup_kind, "quality": item.quality, "price": item.price} for item in self.pickups],
@@ -565,12 +608,18 @@ class GameState:
             "death": {"player_dead": self.player_dead, "restart_phase": self.restart_phase, "restart_count": self.restart_count, "restart_error": self.restart_error},
         }
 
+    def attack_targets(self) -> tuple[Entity, ...]:
+        vulnerable = tuple(item for item in self.enemies if item.vulnerable is not False)
+        return vulnerable or self.enemies
+
     def geometry_features(self) -> dict[str, Any]:
         """Return deterministic safety features computed locally, never by Jev."""
         nearest_enemy = min(self.enemies, key=lambda item: item.position.distance_to(self.player.position), default=None)
         enemy_distance = nearest_enemy.position.distance_to(self.player.position) if nearest_enemy else None
+        attack_target = min(self.attack_targets(), key=lambda item: item.position.distance_to(self.player.position), default=None)
         threatening: list[dict[str, Any]] = []
         for projectile in self.projectiles:
+            closest,closest_tick=projectile_closest_approach(self.player,projectile)
             rel = Vec2(self.player.position.x - projectile.position.x, self.player.position.y - projectile.position.y)
             distance = projectile.position.distance_to(self.player.position)
             speed_sq = projectile.velocity.x * projectile.velocity.x + projectile.velocity.y * projectile.velocity.y
@@ -585,7 +634,9 @@ class GameState:
                 "velocity": projectile.velocity.__dict__,
                 "closing_speed": round(max(0.0, closing_speed), 2),
                 "ttc_frames": ttc,
-                "imminent": bool((ttc is not None and ttc <= 12.0) or distance <= 120.0),
+                "closest_approach_distance": round(closest,1),
+                "closest_approach_frames": round(closest_tick,2),
+                "imminent": projectile_is_imminent(self.player,projectile),
             })
         open_neighbors = 0
         if self.layout.grid_width and self.layout.grid_height and self.player_grid_index >= 0:
@@ -601,6 +652,8 @@ class GameState:
         nearest = threatening[0] if threatening else None
         tracking: list[dict[str, Any]] = []
         for effect in self.danger_effects:
+            if effect.kind not in {"ghost_bomb", "armed_bomb"}:
+                continue
             rel = Vec2(self.player.position.x - effect.position.x, self.player.position.y - effect.position.y)
             distance = effect.position.distance_to(self.player.position)
             closing_speed = (rel.x * effect.velocity.x + rel.y * effect.velocity.y) / max(distance, 1.0)
@@ -621,9 +674,9 @@ class GameState:
         tracking.sort(key=lambda item: item["distance"])
         nearest_tracking = tracking[0] if tracking else None
         line_of_fire_blocked = False
-        if nearest_enemy:
-            dx = nearest_enemy.position.x - self.player.position.x
-            dy = nearest_enemy.position.y - self.player.position.y
+        if attack_target:
+            dx = attack_target.position.x - self.player.position.x
+            dy = attack_target.position.y - self.player.position.y
             length_sq = dx * dx + dy * dy
             for hazard in self.hazards:
                 if not hazard.destructible:
@@ -640,7 +693,7 @@ class GameState:
             # grid_index for both player and enemies, so sample the discrete
             # grid segment and inspect only the cells between the endpoints.
             player_grid = self.player_grid_index if self.player_grid_index >= 0 else self.player.grid_index
-            enemy_grid = nearest_enemy.grid_index
+            enemy_grid = attack_target.grid_index
             width, height = self.layout.grid_width, self.layout.grid_height
             if (not line_of_fire_blocked and width and height
                     and player_grid >= 0 and enemy_grid >= 0
@@ -664,14 +717,20 @@ class GameState:
                     if (col, row) == (ecol, erow):
                         break
                     index = row * width + col
-                    if index in self.layout.blocked:
+                    if index in (self.layout.shot_blocked if self.layout.shot_blocked is not None else self.layout.blocked):
                         line_of_fire_blocked = True
                         break
         return {
             "nearest_enemy_distance": round(enemy_distance, 1) if enemy_distance is not None else None,
             "enemy_range_margin": round(self.player.tear_range - enemy_distance, 1) if enemy_distance is not None else None,
             "wall_clearance_neighbors": open_neighbors,
-            "line_of_fire": bool(nearest_enemy) and not line_of_fire_blocked,
+            # An unobstructed diagonal is not a cardinal tear firing lane.
+            "attack_target_id": attack_target.entity_id if attack_target else None,
+            "attack_target_distance": round(attack_target.position.distance_to(self.player.position),1) if attack_target else None,
+            "line_of_fire": bool(attack_target) and not line_of_fire_blocked and min(
+                abs(attack_target.position.x - self.player.position.x),
+                abs(attack_target.position.y - self.player.position.y),
+            ) <= 22.0,
             "line_of_fire_blocked": line_of_fire_blocked,
             "projectile_threats": threatening,
             "nearest_projectile_ttc_frames": nearest["ttc_frames"] if nearest else None,

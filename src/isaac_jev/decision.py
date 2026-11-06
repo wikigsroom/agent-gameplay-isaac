@@ -10,13 +10,14 @@ import urllib.request
 from dataclasses import dataclass, replace
 from typing import Any
 
-from .models import Action, GameState, Vec2
-from .navigation import bombing_position, door_is_usable, door_path_distance, firing_position, move_towards, newly_opened_secret_door, path_distance
+from .models import Action, GameState, Vec2, projectile_is_imminent
+from .navigation import bombing_position, door_is_usable, door_path_distance, firing_position, grid_cell_center, move_towards, newly_opened_secret_door, path_distance
 from .tuning import PolicyProfile
 
 SCHEMA_VERSION = "jev-policy-v2"
 _LOOT_MODES = frozenset({"item", "shop", "pickup", "chest", "hazard", "bomb", "bomb_wall", "tnt"})
 BOSS_REWARD_SPAWN_FRAMES = 60
+JOKER_CARD_ID = 31  # Read from Card.CARD_JOKER in the running 1.7.9b game.
 
 
 def _boss_reward_wait_action(state: GameState) -> Action | None:
@@ -485,7 +486,7 @@ def decision_rules() -> dict[str, Any]:
     }
     action_ids = (
         "advance_and_fire", "advance_and_evade_fire", "hold_and_fire", "retreat_and_fire",
-        "strafe_left", "strafe_right", "reposition_and_fire", "reposition_to_fire_lane", "evade_projectile",
+        "strafe_left", "strafe_right", "reposition_and_fire", "reposition_to_fire_lane", "route_to_firing_lane", "evade_projectile",
         "retreat_from_enemy", "mandatory_evade_and_fire", "dodge_charge_left", "dodge_charge_right",
         "evade_ghost_bomb", "evade_ghost_bomb_left", "evade_ghost_bomb_right",
         "clear_hazard_<id>", "bomb_hazard_<id>", "bomb_boss_<id>", "bomb_secret_<slot>", "bomb_super_secret_<slot>", "open_chest_<id>", "take_item_<id>",
@@ -524,6 +525,15 @@ def _is_open(state: GameState, move: Vec2) -> bool:
         return True
     row, col = divmod(state.player_grid_index, layout.grid_width)
     dx, dy = int(move.x), int(move.y)
+    # A short step back toward the current tile's center need not enter the
+    # neighboring blocked tile. Require the live Lua collision check too.
+    if bool(dx) != bool(dy):
+        name = {(1, 0): "right", (-1, 0): "left", (0, 1): "down", (0, -1): "up"}.get((dx, dy))
+        center = grid_cell_center(state, state.player_grid_index)
+        if center is not None and state.safe_move_directions.get(name) == "safe":
+            offset = (center.x-state.player.position.x)*dx + (center.y-state.player.position.y)*dy
+            if 6 < offset <= 21 and state.player_grid_index not in layout.blocked | layout.danger_grid_indices:
+                return True
     candidates = [(row + dy, col + dx)]
     if dx and dy:  # Do not cut diagonally through an obstacle corner.
         candidates.extend(((row, col + dx), (row + dy, col)))
@@ -651,10 +661,30 @@ def _hazard_blocks_enemy(state: GameState, enemy: Any) -> bool:
     return False
 
 
+def _opens_needed_door(state: GameState, barrier: Any) -> bool:
+    """Spend an ordinary bomb only on a rock which repairs a necessary route."""
+    if (not state.room_clear or state.enemies or barrier.grid_index<0
+            or not state.layout.grid_width or state.bombs<=0):
+        return False
+    doors=[door for door in state.layout.doors if door_is_usable(door,state)
+           and (door.target_room_index not in state.visited_room_indices
+                or door.slot==state.planned_door_slot or door.target_is_boss)
+           and door_path_distance(state,door)==float('inf')]
+    if not doors:
+        return False
+    cell=frozenset({barrier.grid_index})
+    future=replace(state,hazards=tuple(h for h in state.hazards if h!=barrier),
+        layout=replace(state.layout,blocked=state.layout.blocked-cell,
+            danger_grid_indices=state.layout.danger_grid_indices-cell))
+    return any(door_path_distance(future,door)<float('inf') for door in doors)
+
+
 def _active_hazards(state: GameState) -> tuple:
     return tuple(
         item for item in state.hazards
         if item.destructible
+        and not (state.room_clear and item.kind=="red_poop")
+        and (item.kind!="passage_rock" or _opens_needed_door(state,item))
         and item.entity_id not in state.ignored_hazard_ids
         and not (item.requires_bomb and state.bomb_placed and item.entity_id == state.bomb_target_id)
         and (not item.requires_bomb or state.bombs > 0)
@@ -687,11 +717,17 @@ def _tracking_bomb_threats(state: GameState, imminent_only: bool = False) -> tup
     """Return ghost bombs that are closing on Isaac, ordered by urgency."""
     threats = []
     for effect in state.danger_effects:
+        if effect.kind not in {"ghost_bomb", "armed_bomb"}:
+            continue
         offset = Vec2(state.player.position.x - effect.position.x,
                       state.player.position.y - effect.position.y)
         distance = effect.position.distance_to(state.player.position)
         closing_speed = (offset.x * effect.velocity.x + offset.y * effect.velocity.y) / max(distance, 1.0)
         ttc = distance / closing_speed if closing_speed > 0.01 else None
+        if effect.kind == "armed_bomb":
+            if distance <= effect.radius + 65:
+                threats.append((0.0, distance, effect))
+            continue
         imminent = bool((ttc is not None and ttc <= 24.0) or distance <= 150.0)
         if closing_speed > 0.01 and distance <= 260.0 and (not imminent_only or imminent):
             threats.append((ttc if ttc is not None else 999.0, distance, effect))
@@ -737,10 +773,14 @@ def tracking_bomb_actions(state: GameState) -> list[Action]:
 
 
 def _projectile_imminent(state: GameState, projectile: Any, profile: PolicyProfile) -> bool:
-    distance = projectile.position.distance_to(state.player.position)
-    offset = Vec2(state.player.position.x - projectile.position.x, state.player.position.y - projectile.position.y)
-    closing = offset.x * projectile.velocity.x + offset.y * projectile.velocity.y > 0.25
-    return distance <= profile.projectile_evade_radius * 1.15 or (closing and distance <= profile.projectile_evade_radius * 1.8)
+    return projectile_is_imminent(state.player,projectile)
+
+
+def _combat_firing_distance(target: Any, profile: PolicyProfile) -> float:
+    finisher=target.kind==24 and (target.hit_points<=3.5 or 'regen' in target.telegraph.lower())
+    reactive=(target.kind==99 or (target.kind==81 and target.variant==0)
+              or (target.kind==24 and not finisher))
+    return max(profile.enemy_safe_distance,185 if reactive else 0)
 
 
 def _raw_candidate_actions(state: GameState, profile: PolicyProfile | None = None) -> list[Action]:
@@ -756,6 +796,15 @@ def _raw_candidate_actions(state: GameState, profile: PolicyProfile | None = Non
         recovery = recovery_actions(state)
         if recovery:
             return recovery
+        # A short walkable tile may end at a destructible barrier, so no
+        # two-tile recovery waypoint exists. Clear a reachable firing target
+        # instead of letting recovery permanently suppress obstacle removal.
+        clearable=[item for item in hazard_actions(state) if item.mode=="hazard"]
+        if clearable:
+            return clearable
+        short_recovery = recovery_actions(state, allow_short=True)
+        if short_recovery:
+            return short_recovery
         return [Action("wait_for_recovery_route", Vec2(), Vec2(), mode="wait",
                        reason="no Lua-confirmed safe recovery direction; recheck on next state")]
     # Room:IsClear() is authoritative for trap rooms. Some mechanical room
@@ -812,22 +861,52 @@ def _raw_candidate_actions(state: GameState, profile: PolicyProfile | None = Non
         return strategic_actions(state)
 
     threats = _threatening_projectiles(state, profile)
-    if threats:
+    if threats and (state.enemies or any(_projectile_imminent(state, item, profile) for item in threats)):
         return combat_actions(state, profile)
 
-    # Combat has priority. Obstacles are only a combat fallback when the
-    # target is geometrically blocked or the runtime has observed a loop.
+    # A repeated combat action can be a productive firing lane. Never turn
+    # that alone, or one occluded enemy among several, into resource farming.
     if state.enemies:
-        if (state.combat_stuck and active_hazards) or any(
-            _hazard_blocks_enemy(state, enemy) for enemy in state.enemies
-        ):
-            clearable = hazard_actions(state)
+        shootable = tuple(hazard for hazard in active_hazards if not hazard.requires_bomb)
+        obstacle_state = replace(state, hazards=shootable)
+        if (shootable and all(enemy.position.distance_to(state.player.position) > 130
+                and _hazard_blocks_enemy(obstacle_state, enemy) for enemy in state.enemies)):
+            clearable = hazard_actions(obstacle_state)
             if clearable:
                 return clearable
             # A failed bomb or inaccessible firing lane may leave hazards in
             # the observation but no executable clear action. Keep fighting
             # instead of turning an empty list into permanent idle time.
+        # A doorway barrier can disconnect the whole enemy enclosure without
+        # lying on the direct ray to each enemy. Only clear it when no normal
+        # firing lane exists and removing this exact barrier opens one. This
+        # is route repair, not optional resource farming during combat.
+        if (shootable and state.layout.grid_width
+                and all(enemy.position.distance_to(state.player.position) > 130 for enemy in state.enemies)):
+            def has_lane(observation):
+                return any(firing_position(observation, enemy.position, enemy.grid_index,
+                    minimum_range=_combat_firing_distance(enemy,profile),
+                    avoid_dead_ends=enemy.kind not in {27,204}) is not None
+                    for enemy in observation.attack_targets())
+            if not has_lane(state):
+                for barrier in shootable:
+                    if barrier.grid_index<0:
+                        continue
+                    cell=frozenset({barrier.grid_index})
+                    future=replace(state,hazards=tuple(h for h in state.hazards if h!=barrier),
+                        layout=replace(state.layout,blocked=state.layout.blocked-cell,
+                            shot_blocked=(state.layout.shot_blocked-cell if state.layout.shot_blocked is not None else None),
+                            danger_grid_indices=state.layout.danger_grid_indices-cell))
+                    if has_lane(future):
+                        clearable=[a for a in hazard_actions(replace(state,hazards=(barrier,))) if a.mode=='hazard']
+                        if clearable:
+                            return clearable
         return combat_actions(state, profile)
+    # An exit plate may be what makes the room clear in the first place.
+    # Operate it after live enemies/projectiles, without waiting for IsClear.
+    mechanisms = mechanism_actions(state)
+    if mechanisms and mechanisms[0].mode == "button":
+        return mechanisms
     # A live fire/poop obstacle can hide an enemy or block the only useful
     # firing lane. Clear it before combat; relying only on a 2-D line test is
     # unsafe because grid hazards and enemy hitboxes do not share coordinates.
@@ -838,7 +917,7 @@ def _raw_candidate_actions(state: GameState, profile: PolicyProfile | None = Non
     return [Action("wait_for_room_clear", Vec2(), Vec2(), mode="wait", reason="wait for a confirmed room-clear state")]
 
 
-def recovery_actions(state: GameState) -> list[Action]:
+def recovery_actions(state: GameState, *, allow_short: bool = False) -> list[Action]:
     """Offer distinct, locally walkable short waypoints during a confirmed stall."""
     directions = (("up", Vec2(0, -1)), ("down", Vec2(0, 1)),
                   ("left", Vec2(-1, 0)), ("right", Vec2(1, 0)))
@@ -852,19 +931,31 @@ def recovery_actions(state: GameState) -> list[Action]:
             continue
         if not _is_open(state, move):
             continue
+        waypoint = Vec2(state.player.position.x + move.x * 64,
+                        state.player.position.y + move.y * 64)
         if state.layout.grid_width and state.layout.grid_height and state.player_grid_index >= 0:
             row, col = divmod(state.player_grid_index, state.layout.grid_width)
             target_row, target_col = row + int(move.y) * 2, col + int(move.x) * 2
-            if not (0 <= target_row < state.layout.grid_height and 0 <= target_col < state.layout.grid_width):
-                continue
-            target_index = target_row * state.layout.grid_width + target_col
-            if target_index in state.layout.blocked or target_index in state.layout.danger_grid_indices:
-                continue
+            blocked = state.layout.blocked | state.layout.danger_grid_indices
+            if (not (0 <= target_row < state.layout.grid_height and 0 <= target_col < state.layout.grid_width)
+                    or target_row * state.layout.grid_width + target_col in blocked):
+                if not allow_short:
+                    continue
+                # A one-cell neck can require one step before a turn. Retain
+                # the live Lua admission and prefer a real adjacent centre;
+                # _is_open can also admit recentering within the current cell.
+                next_row, next_col = row + int(move.y), col + int(move.x)
+                if (0 <= next_row < state.layout.grid_height and 0 <= next_col < state.layout.grid_width
+                        and next_row * state.layout.grid_width + next_col not in blocked):
+                    target_index = next_row * state.layout.grid_width + next_col
+                else:
+                    target_index = state.player_grid_index
+                waypoint = grid_cell_center(state, target_index)
+                if waypoint is None or waypoint.distance_to(state.player.position) <= 6:
+                    continue
         action_id = f"recover_{name}"
         if state.movement_blocked and state.last_action_id == action_id:
             continue
-        waypoint = Vec2(state.player.position.x + move.x * 64,
-                        state.player.position.y + move.y * 64)
         if door and waypoint.distance_to(door.position) < 32:
             continue
         options.append(Action(
@@ -883,19 +974,20 @@ def mechanism_actions(state: GameState) -> list[Action]:
     if closed_exit:
         buttons = [event for event in state.layout.grid_events
                    if event.kind == "button" and event.active and not event.triggered
-                   and path_distance(state, event.position, event.grid_index) < float("inf")]
+                   and path_distance(state, event.position, event.grid_index,allow_timed=True) < float("inf")]
         if buttons:
-            button = min(buttons, key=lambda event: path_distance(state, event.position, event.grid_index))
+            button = min(buttons, key=lambda event: path_distance(state, event.position, event.grid_index,allow_timed=True))
             return [Action(
                 f"press_button_{button.entity_id}", move_towards(state, button.position, button.grid_index), Vec2(),
                 mode="button", target="exit button", reason="press the reachable plate to unlock closed exits",
+                waypoint=button.position,
             )]
     tnts = [event for event in state.layout.grid_events if event.kind == "tnt" and event.active
             and event.entity_id not in state.ignored_hazard_ids]
     if tnts:
         actions = []
         for tnt in sorted(tnts, key=lambda event: event.position.distance_to(state.player.position))[:4]:
-            lane = firing_position(state, tnt.position, tnt.grid_index, minimum_range=150)
+            lane = firing_position(state, tnt.position, tnt.grid_index, minimum_range=160)
             if lane is None:
                 continue
             position, index, direction = lane
@@ -905,6 +997,7 @@ def mechanism_actions(state: GameState) -> list[Action]:
                 Vec2() if approaching else direction,
                 mode="tnt", target="TNT barrel",
                 reason="approach a reachable firing lane inside tear range and outside the blast radius",
+                waypoint=position if approaching else None,
             ))
         return actions
     return []
@@ -915,7 +1008,7 @@ def hazard_actions(state: GameState) -> list[Action]:
     targets = sorted(
         _active_hazards(state),
         key=lambda item: (not item.requires_bomb, item.position.distance_to(state.player.position), item.entity_id),
-    )[:3]
+    )
     if state.last_action_mode in {"hazard", "bomb"}:
         active_target = next(
             (item for item in targets if state.last_action_id in {f"clear_hazard_{item.entity_id}", f"bomb_hazard_{item.entity_id}"}),
@@ -927,6 +1020,8 @@ def hazard_actions(state: GameState) -> list[Action]:
         return [Action("wait_for_hazard_clear", Vec2(), Vec2(), mode="wait", reason="observed obstacles are not marked destructible")]
     actions: list[Action] = []
     for target in targets:
+        if len(actions)>=3:
+            break
         delta = Vec2(target.position.x - state.player.position.x, target.position.y - state.player.position.y)
         distance = target.position.distance_to(state.player.position)
         if target.kind in {"blue_fire", "purple_fire"} and state.bombs <= 4:
@@ -960,6 +1055,7 @@ def hazard_actions(state: GameState) -> list[Action]:
             Vec2() if approaching else direction,
             mode="hazard", target=target.kind,
             reason=f"approach a clear firing lane, then destroy {target.kind} from {distance:.0f} pixels",
+            waypoint=position,
         ))
     return actions
 
@@ -984,14 +1080,49 @@ def bomb_wall_actions(state: GameState) -> list[Action]:
 
 def combat_actions(state: GameState, profile: PolicyProfile | None = None) -> list[Action]:
     profile = profile or PolicyProfile()
-    enemy = _nearest(state, state.enemies)
+    enemy = _nearest(state, state.attack_targets())
     projectile_candidates = _threatening_projectiles(state, profile)
     projectile = _nearest(state, projectile_candidates)
     aim = _predictive_enemy_aim(state, enemy) if enemy else Vec2()
+    def safe_firing_distance(target):
+        return _combat_firing_distance(target,profile)
+    def safe_firing_axis(target):
+        # Monstro II fires horizontally. A rock can block the native local
+        # dodge, so the long route must also lead to a vertical firing lane.
+        if target.kind == 43 and target.variant == 0:
+            return "vertical"
+        if target.kind in {39, 49}:
+            animation = target.telegraph.lower()
+            if "horiz" in animation:
+                return "vertical"
+            if any(part in animation for part in ("vert", "up", "down")):
+                return "horizontal"
+        return None
     def with_boss_bomb(actions: list[Action]) -> list[Action]:
+        # Give the frame-level controller a route around walls, rather than
+        # letting a locally aligned but obstructed target pin it in place.
+        if state.layout.grid_width and state.enemies:
+            lanes = []
+            def finisher_priority(item):
+                return int(not (item.kind == 24 and "regen" in item.telegraph.lower()))
+            for target in sorted(state.attack_targets(), key=lambda item: (finisher_priority(item), item.position.distance_to(state.player.position)))[:4]:
+                lane = firing_position(state, target.position, target.grid_index,
+                                       minimum_range=safe_firing_distance(target),
+                                       avoid_dead_ends=target.kind not in {27,204},
+                                       firing_axis=safe_firing_axis(target))
+                if lane is not None:
+                    position, index, _ = lane
+                    lanes.append((finisher_priority(target),path_distance(state, position, index), position, index))
+            if lanes:
+                _, _, position, index = min(lanes, key=lambda item: item[:2])
+                route_move = move_towards(state, position, index)
+                if position.distance_to(state.player.position) > 22 and route_move != Vec2():
+                    route = Action("route_to_firing_lane", route_move, Vec2(), mode="combat",
+                        waypoint=position, reason="follow a reachable firing lane around obstacles; evade live threats each frame")
+                    actions = [route] + [replace(item, waypoint=position) for item in actions]
         boss_room = state.layout.is_boss or state.layout.room_type == "boss"
         boss_target = min(
-            (item for item in state.enemies if item.is_boss
+            (item for item in state.attack_targets() if item.is_boss
              and 55.0 <= item.position.distance_to(state.player.position) <= 110.0),
             key=lambda item: item.position.distance_to(state.player.position), default=None,
         )
@@ -1024,6 +1155,16 @@ def combat_actions(state: GameState, profile: PolicyProfile | None = None) -> li
         threat = Vec2(-aim.x, -aim.y)
     lateral = _safe_move(state, Vec2(-threat.y, threat.x), avoid_corner=True)
     opposite_lateral = _safe_move(state, Vec2(threat.y, -threat.x), avoid_corner=True)
+    if projectile and not enemy:
+        retreat = _safe_move(state, threat, avoid_corner=True)
+        movement = lateral if lateral != Vec2() else retreat
+        # Trap fire may be perpetual until its plate is pressed. Keep the
+        # reachable plate as a route goal while Lua chooses a safe step from
+        # the current projectiles; an emergency must not erase that goal.
+        mechanism = next((item for item in mechanism_actions(state) if item.mode == "button"), None)
+        return [Action("evade_projectile", movement, Vec2(), mode="combat",
+                       waypoint=mechanism.waypoint if mechanism else None,
+                       reason="dodge live trap fire without inventing a hostile shooting target")]
     # When the Lua observation contains an imminent projectile, standing still
     # or closing distance is never an admissible choice.
     if projectile:
@@ -1063,6 +1204,37 @@ def combat_actions(state: GameState, profile: PolicyProfile | None = None) -> li
                 reason="leave the blocked wall/corner while maintaining a safe firing position",
             )])
     distance = enemy.position.distance_to(state.player.position)
+    geometry = state.geometry_features()
+    attack_distance = max(_attack_distance(state, profile), profile.enemy_safe_distance * 1.25)
+    if _is_stationary(enemy) and (geometry.get("line_of_fire_blocked") or
+            (distance <= attack_distance and not geometry.get("line_of_fire")) or enemy.kind in {27,204}):
+        lane = firing_position(state, enemy.position, enemy.grid_index,
+                               minimum_range=safe_firing_distance(enemy),
+                               avoid_dead_ends=enemy.kind not in {27,204},
+                               firing_axis=safe_firing_axis(enemy))
+        # Closed Hosts in a narrow alcove can have no reachable lane at the
+        # preferred distance. An 80px lane still clears their body; the native
+        # planner continues to veto actual contact, bombs, beams and bullets.
+        if lane is None and enemy.kind in {27, 204}:
+            lane = firing_position(state, enemy.position, enemy.grid_index, minimum_range=70)
+        if lane is None and enemy.kind in {27, 204} and enemy.variant == 0:
+            # The observed rock corridor exposes only the adjacent 40px cell.
+            # This enemy is fixed in place; native body/bullet guards still
+            # apply and it waits for an actual vulnerable firing window.
+            lane = firing_position(state, enemy.position, enemy.grid_index, minimum_range=35)
+        if lane is not None:
+            position, index, _shoot = lane
+            move = move_towards(state, position, index)
+            if move != Vec2() and _is_open(state, move):
+                return with_boss_bomb([Action(
+                    "reposition_to_fire_lane", move, Vec2(), mode="combat", waypoint=position,
+                    reason="align a walkable cardinal firing lane before shooting at a stationary enemy",
+                )])
+            if enemy.kind in {27,204} and move == Vec2() and state.player.position.distance_to(position) <= 14:
+                return with_boss_bomb([Action(
+                    "hold_and_fire", Vec2(), _shoot, mode="combat", waypoint=position,
+                    reason="retain the reachable firing lane while native control waits for vulnerability",
+                )])
     approach = _safe_move(state, move_towards(state, enemy.position))
     # Stationary enemies and enemies at range need deliberate closing movement;
     # otherwise the model tends to choose hold_and_fire and hug a wall forever.
@@ -1132,13 +1304,93 @@ def combat_actions(state: GameState, profile: PolicyProfile | None = None) -> li
     return with_boss_bomb(actions)
 
 
-def _pickup_score(state: GameState, price: int, quality: int) -> int:
-    affordable = price <= 0 or price <= state.coins
-    return quality * 100 + (20 if affordable else -200) - max(price, 0)
+def _safe_pickup_price(state: GameState, price: int, pickup: Any = None) -> bool:
+    if price in {0, -1000} or 0 < price <= state.coins:
+        return True
+    # A deliberate early Devil purchase can improve the build and future
+    # Sheol access. Only known red-container prices are budgeted; mixed/soul
+    # prices and uncertain bone-container interactions remain inadmissible.
+    if (price not in {-1, -2} or pickup is None or not pickup.is_collectible
+            or state.progression_target != "satan" or state.layout.room_type != "devil"
+            or not state.room_clear or state.enemies or not 2 <= state.stage < 8
+            or state.bone_hearts > 0):
+        return False
+    if pickup.subtype <= 0 or pickup.subtype in {168,329,358,233,394,352,474,316}:
+        return False
+    # These pickups replace or remove red containers themselves. The price
+    # formula alone cannot promise our retained-container survival budget.
+    if pickup.subtype in {81, 230, 549}:  # Dead Cat, Abaddon, Brittle Bones
+        return False
+    if pickup.subtype != 84 and pickup.quality < (3 if price == -1 else 4):
+        return False
+    remaining_max = state.max_hearts - (-price * 2)
+    remaining_health = min(state.player.hit_points,
+        min(state.red_hearts, max(0, remaining_max)) + state.soul_hearts)
+    return remaining_max >= 4 and remaining_health >= 6
+
+
+def _safe_consumable_pickup(state: GameState, pickup: Any) -> bool:
+    if pickup.pickup_kind not in {"pill", "card"}:
+        return True
+    if (state.progression_target == "satan" and pickup.pickup_kind == "card"
+            and pickup.subtype == JOKER_CARD_ID and not any(card == JOKER_CARD_ID for _,card in state.held_cards)):
+        return True
+    # Never cycle full pockets. A card may replace a retained unknown pill;
+    # once a card is held, keep it until its normal use condition is met.
+    if state.held_cards:
+        return False
+    return pickup.pickup_kind == "card" or not state.held_pills
+
+
+def _pickup_score(state: GameState, price: int, quality: int, pickup: Any = None) -> int:
+    affordable = _safe_pickup_price(state, price, pickup)
+    route_bonus=(1000 if affordable and state.progression_target=='satan' and state.stage<=8
+                 and pickup is not None and pickup.is_collectible and pickup.subtype==84 else 0)
+    return route_bonus + quality * 100 + (20 if affordable else -200) - max(price, 0)
 
 
 def strategic_actions(state: GameState) -> list[Action]:
     boss_room = state.layout.is_boss or state.layout.room_type == "boss"
+    if state.progression_target == "satan" and state.stage == 8:
+        # A naturally opened Devil Room can lead to Sheol before It Lives is
+        # unlocked. Its special room index is negative, which is valid here.
+        if boss_room and state.room_clear:
+            exits = [door for door in state.layout.doors
+                     if door.target_room_type == "devil" and door_is_usable(door, state)
+                     and door_path_distance(state, door) < float("inf")]
+            if exits:
+                door = min(exits, key=lambda item: door_path_distance(state, item))
+                return [Action(f"enter_door_{door.slot}",
+                    move_towards(state, door.position, door.grid_index), Vec2(),
+                    mode="navigate", target="Devil Room route to Sheol",
+                    reason="continue toward Satan before touching the ending chest")]
+        if state.room_clear and (boss_room or state.layout.room_type == "devil") and state.boss_exit_available:
+            return [Action(f"enter_boss_exit_{state.boss_exit_grid_index}",
+                move_towards(state, state.boss_exit_position, state.boss_exit_grid_index), Vec2(),
+                mode="boss_exit", target="Sheol",
+                reason="use the observed native trapdoor to continue toward Satan")]
+    if (boss_room and state.room_clear and state.boss_exit_available
+            and state.room_cleared_frame >= 0 and state.frame-state.room_cleared_frame >= 240
+            and any(effect.kind == 'moving_spike'
+                    and effect.position.distance_to(state.boss_exit_position) < effect.radius+18
+                    for effect in state.floor_danger_effects)):
+        # Loki can leave a Poky over the newly opened trapdoor. An ordinary
+        # exit/re-entry refreshes an already cleared room without fighting or
+        # touching the trap; never teleport or remove the blocking entity.
+        exits=[door for door in state.layout.doors if door_is_usable(door,state)
+               and door_path_distance(state,door)<float('inf')]
+        if exits:
+            door=min(exits,key=lambda item:door_path_distance(state,item))
+            return [Action(f'enter_door_{door.slot}',
+                move_towards(state,door.position,door.grid_index),Vec2(),mode='navigate',
+                target='clear boss room re-entry',
+                reason='leave normally so the cleared room can refresh its obstructed floor exit')]
+    for pickup in state.pickups:
+        if pickup.pickup_kind in {"ending_chest", "ending_trophy"}:
+            return [Action(f"take_pickup_{pickup.entity_id}",
+                move_towards(state, pickup.position, pickup.grid_index), Vec2(),
+                mode="pickup", target=pickup.name, reason="walk into the native ending reward",
+                waypoint=pickup.position)]
     # Boss rewards are the primary objective once the native clear flag is
     # true. Residual poop/fire can be handled afterward; letting it win here
     # leaves the controller circling an obstacle while the item is untouched.
@@ -1153,7 +1405,7 @@ def strategic_actions(state: GameState) -> list[Action]:
         "bomb_chest": 70, "wooden_chest": 65, "old_chest": 60, "chest": 55,
     }
     chests = sorted(
-        (item for item in state.pickups if item.pickup_kind in chest_priority and item.entity_id not in state.ignored_pickup_ids
+        (item for item in state.pickups if item.pickup_kind in chest_priority and _safe_optional_chest(state, item) and item.entity_id not in state.ignored_pickup_ids
          and path_distance(state, item.position, item.grid_index) < float("inf")),
         key=lambda item: chest_priority[item.pickup_kind], reverse=True,
     )
@@ -1166,10 +1418,10 @@ def strategic_actions(state: GameState) -> list[Action]:
     collectibles = sorted(
         (item for item in state.pickups if item.is_collectible and item.entity_id not in state.ignored_pickup_ids
          and path_distance(state, item.position, item.grid_index) < float("inf")),
-        key=lambda item: _pickup_score(state, item.price, item.quality), reverse=True,
+        key=lambda item: _pickup_score(state, item.price, item.quality, item), reverse=True,
     )
     for pickup in collectibles:
-        affordable = pickup.price <= 0 or pickup.price <= state.coins
+        affordable = _safe_pickup_price(state, pickup.price, pickup)
         if not affordable:
             continue
         item_mode = "shop" if state.layout.room_type == "shop" and pickup.price > 0 else "item"
@@ -1193,6 +1445,8 @@ def strategic_actions(state: GameState) -> list[Action]:
         key=lambda item: loot_priority[item.pickup_kind], reverse=True,
     )
     for pickup in loose_pickups:
+        if not _safe_consumable_pickup(state, pickup):
+            continue
         if pickup.pickup_kind == "trinket" and pickup.subtype in state.held_trinkets:
             continue
         if pickup.pickup_kind in {"red_heart", "red_half_heart", "red_double_heart", "heart"} and state.max_hearts > 0 and state.red_hearts >= state.max_hearts:
@@ -1201,7 +1455,7 @@ def strategic_actions(state: GameState) -> list[Action]:
             continue
         if pickup.pickup_kind == "eternal_heart" and state.eternal_hearts > 0:
             continue
-        if pickup.price > 0 and pickup.price > state.coins:
+        if not _safe_pickup_price(state, pickup.price, pickup):
             continue
         actions.append(Action(
             f"take_pickup_{pickup.entity_id}", move_towards(state, pickup.position, pickup.grid_index), Vec2(), mode="pickup",
@@ -1221,7 +1475,9 @@ def strategic_actions(state: GameState) -> list[Action]:
         boss_rewards = [
             item for item in state.pickups
             if item.entity_id not in state.ignored_pickup_ids
-            and (item.price <= 0 or item.price <= state.coins)
+            and _safe_optional_chest(state, item)
+            and _safe_pickup_price(state, item.price, item)
+            and _safe_consumable_pickup(state, item)
             and not (item.pickup_kind in {"red_heart", "red_half_heart", "red_double_heart", "heart"}
                      and state.max_hearts > 0 and state.red_hearts >= state.max_hearts)
             and not (item.pickup_kind == "soul_heart" and state.soul_hearts >= 24)
@@ -1240,7 +1496,24 @@ def strategic_actions(state: GameState) -> list[Action]:
     boss_wait = _boss_reward_wait_action(state)
     if boss_wait:
         return [boss_wait]
-    if boss_room and state.boss_exit_available and state.boss_exit_grid_index >= 0:
+    if (state.progression_target == "satan" and 2 <= state.stage < 8
+            and boss_room and state.room_clear):
+        # Skipping the first Devil Room guarantees an Angel offer next time.
+        # Inspect a naturally opened Devil Room once before leaving the floor;
+        # paid health offers remain subject to the existing pickup rules.
+        offers = [door for door in state.layout.doors
+                  if door.target_room_type == "devil"
+                  and door.target_room_index not in state.visited_room_indices
+                  and door_is_usable(door, state)
+                  and door_path_distance(state, door) < float("inf")]
+        if offers:
+            door = min(offers, key=lambda item: door_path_distance(state, item))
+            return [Action(f"enter_door_{door.slot}",
+                move_towards(state, door.position, door.grid_index), Vec2(),
+                mode="navigate", target="inspect Devil Room for Satan route",
+                reason="visit the natural offer before the floor exit to avoid guaranteeing the next Angel offer")]
+    if (boss_room and state.boss_exit_available and state.boss_exit_grid_index >= 0
+            and state.planned_goal not in {"return to observed health pickup", "collect observed treasure upgrade before boss", "search treasure upgrade before boss"}):
         return [Action(
             f"enter_boss_exit_{state.boss_exit_grid_index}",
             move_towards(state, state.boss_exit_position, state.boss_exit_grid_index),
@@ -1303,6 +1576,17 @@ def strategic_actions(state: GameState) -> list[Action]:
     return actions or [Action("wait_for_exit", Vec2(), Vec2(), mode="navigate", reason="no usable collectible or exit is currently known")]
 
 
+def _safe_optional_chest(state: GameState, pickup: Any) -> bool:
+    if pickup.pickup_kind in {"spiked_chest", "mimic_chest"}:
+        return False
+    if pickup.pickup_kind in {"locked_chest", "eternal_chest"}:
+        # Preserve a last key while any observed treasure room is unopened.
+        reserve = int(any(door.target_room_type == "treasure"
+            and door.target_room_index not in state.visited_room_indices for door in state.layout.doors))
+        return state.keys > reserve
+    return True
+
+
 def _loot_candidates(state: GameState) -> list[Action]:
     """Return meaningful reward choices without adding navigation or hazards."""
     chest_priority = {
@@ -1312,7 +1596,7 @@ def _loot_candidates(state: GameState) -> list[Action]:
     }
     candidates: list[Action] = []
     chests = sorted(
-        (item for item in state.pickups if item.pickup_kind in chest_priority and item.entity_id not in state.ignored_pickup_ids
+        (item for item in state.pickups if item.pickup_kind in chest_priority and _safe_optional_chest(state, item) and item.entity_id not in state.ignored_pickup_ids
          and path_distance(state, item.position, item.grid_index) < float("inf")),
         key=lambda item: chest_priority[item.pickup_kind], reverse=True,
     )
@@ -1324,9 +1608,9 @@ def _loot_candidates(state: GameState) -> list[Action]:
 
     collectibles = sorted(
         (item for item in state.pickups if item.is_collectible and item.entity_id not in state.ignored_pickup_ids
-         and (item.price <= 0 or item.price <= state.coins)
+         and _safe_pickup_price(state, item.price, item)
          and path_distance(state, item.position, item.grid_index) < float("inf")),
-        key=lambda item: _pickup_score(state, item.price, item.quality), reverse=True,
+        key=lambda item: _pickup_score(state, item.price, item.quality, item), reverse=True,
     )
     for pickup in collectibles:
         item_mode = "shop" if state.layout.room_type == "shop" and pickup.price > 0 else "item"
@@ -1343,6 +1627,9 @@ def _loot_candidates(state: GameState) -> list[Action]:
         "scared_heart": 50, "blended_heart": 70, "rotten_heart": 60, "heart": 35,
         "card": 45, "pill": 35, "trinket": 55, "grab_bag": 65,
     }
+    if state.red_hearts < state.max_hearts:
+        for kind in ("heart", "red_heart", "red_half_heart", "red_double_heart", "scared_heart", "blended_heart"):
+            loot_priority[kind] = 120 if state.player.hit_points <= 3 else 85
     loose_pickups = sorted(
         (item for item in state.pickups if not item.is_collectible and item.pickup_kind in loot_priority
          and item.entity_id not in state.ignored_pickup_ids
@@ -1350,13 +1637,15 @@ def _loot_candidates(state: GameState) -> list[Action]:
         key=lambda item: loot_priority[item.pickup_kind], reverse=True,
     )
     for pickup in loose_pickups:
+        if not _safe_consumable_pickup(state, pickup):
+            continue
         if pickup.pickup_kind in {"red_heart", "red_half_heart", "red_double_heart", "heart"} and state.max_hearts > 0 and state.red_hearts >= state.max_hearts:
             continue
         if pickup.pickup_kind == "soul_heart" and state.soul_hearts >= 24:
             continue
         if pickup.pickup_kind == "eternal_heart" and state.eternal_hearts > 0:
             continue
-        if pickup.price > 0 and pickup.price > state.coins:
+        if not _safe_pickup_price(state, pickup.price, pickup):
             continue
         if pickup.pickup_kind == "trinket" and pickup.subtype in state.held_trinkets:
             continue
@@ -1512,11 +1801,15 @@ def hard_rule_filter(state: GameState, candidates: list[Action], profile: Policy
             if target is not None and target.kind in {"blue_fire", "purple_fire"} and state.bombs <= 4:
                 rule = "special_fire_requires_more_than_four_bombs"
         if action.mode in {"item", "shop"}:
-            pickup = next((item for item in state.pickups if str(item.entity_id) in action.action_id), None)
-            if pickup is not None and pickup.price > state.coins:
+            pickup = next((item for item in state.pickups if str(item.entity_id) == action.action_id.rsplit("_", 1)[-1]), None)
+            if pickup is not None and not _safe_pickup_price(state, pickup.price, pickup):
                 rule = "unaffordable_pickup"
         if action.mode == "pickup":
-            pickup = next((item for item in state.pickups if str(item.entity_id) in action.action_id), None)
+            pickup = next((item for item in state.pickups if str(item.entity_id) == action.action_id.rsplit("_", 1)[-1]), None)
+            if pickup is not None and not _safe_consumable_pickup(state, pickup):
+                rule = "keep_held_consumable"
+            elif pickup is not None and not _safe_pickup_price(state, pickup.price, pickup):
+                rule = "unaffordable_pickup"
             if pickup is not None and pickup.pickup_kind in {"red_heart", "red_half_heart", "red_double_heart", "heart"} and state.max_hearts > 0 and state.red_hearts >= state.max_hearts:
                 rule = "full_health_red_heart"
         if action.mode == "navigate":
@@ -1653,7 +1946,9 @@ def repeat_action_penalty_action(state: GameState, previous: Action, profile: Po
         else f"repeat penalty after {profile.repeat_action_threshold} identical decisions"
     )
     if state.enemies:
-        alternatives = [item for item in combat_actions(state, profile) if item.action_id != previous.action_id and item.move != Vec2()]
+        alternatives = [item for item in combat_actions(state, profile)
+                        if (item.action_id != previous.action_id or item.waypoint is not None)
+                        and item.move != Vec2()]
         if alternatives:
             selected = alternatives[0]
             return _safety_filter(
@@ -1667,6 +1962,7 @@ def repeat_action_penalty_action(state: GameState, previous: Action, profile: Po
                     "combat",
                     previous.target,
                     reason,
+                    waypoint=selected.waypoint,
                 ),
                 profile,
             )

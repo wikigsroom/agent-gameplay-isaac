@@ -155,7 +155,7 @@ def main() -> None:
     parser.add_argument("--path", default="logs/decision_traces.jsonl")
     parser.add_argument("--experiment-path", default="logs/experiment_runs.jsonl")
     parser.add_argument("--seed", default=None, help="Only include this run seed in provider statistics")
-    parser.add_argument("--provider", choices=("laya", "jev", "bocha", "systemone", "local"), default=None)
+    parser.add_argument("--provider", choices=("jev", "bocha", "systemone", "local"), default=None)
     parser.add_argument("--model", default=None, help="Only include this provider model")
     args = parser.parse_args()
     traces = read_traces(args.path)

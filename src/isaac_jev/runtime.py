@@ -19,6 +19,7 @@ from .navigation import door_is_usable, door_path_distance, newly_opened_secret_
 from .telemetry import EpisodeRecorder
 from .replay import DecisionTraceRecorder
 from .tuning import PolicyProfile, load_profile
+from .snapshots import publish_json
 from .providers import DecisionProviderConfig, JevProvider, ProviderConfigStore, ProviderDecision, create_provider
 from .experiment import ExperimentEventRecorder, IncrementalStatistics
 
@@ -83,6 +84,9 @@ class Controller:
     _hazard_target_id: int = field(default=-1, init=False)
     _hazard_last_distance: float | None = field(default=None, init=False)
     _hazard_last_progress_frame: int = field(default=0, init=False)
+    _hazard_progress_by_target: dict[int, tuple[float, float, int]] = field(default_factory=dict, init=False)
+    _hazard_animation_by_target: dict[int, str] = field(default_factory=dict, init=False)
+    _hazard_retry_after: dict[int, int] = field(default_factory=dict, init=False)
     _unreachable_targets: list[str] = field(default_factory=list, init=False)
     _effective_action: Action | None = field(default=None, init=False)
     _last_response_signature: tuple[Any, ...] | None = field(default=None, init=False)
@@ -140,8 +144,8 @@ class Controller:
     _provider_store: ProviderConfigStore = field(init=False)
     _provider_config: DecisionProviderConfig = field(init=False)
     _pending_provider_config: DecisionProviderConfig = field(init=False)
-    _active_provider_name: str = field(default="laya", init=False)
-    _active_provider_model: str = field(default="laya-rl-agent", init=False)
+    _active_provider_name: str = field(default="local", init=False)
+    _active_provider_model: str = field(default="local-policy", init=False)
     _provider_generation: int = field(default=0, init=False)
     _run_id: str = field(default="", init=False)
     _run_seed: int | None = field(default=None, init=False)
@@ -157,6 +161,11 @@ class Controller:
     _boss_clear_observed_frame: int = field(default=-1, init=False)
     _last_player_dead: bool = field(default=False, init=False)
     _run_end_recorded: bool = field(default=False, init=False)
+    _game_result: dict[str, Any] | None = field(default=None, init=False)
+    _progress_key: tuple[Any, ...] | None = field(default=None, init=False)
+    _raw_state_at: float = field(default=0.0, init=False)
+    _delivered_signature: tuple[Any, ...] | None = field(default=None, init=False)
+    _delivered_sequence: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         self._profile = (self.policy_profile or load_profile(self.log_dir)).bounded()
@@ -263,6 +272,7 @@ class Controller:
         import uuid
         self._run_id = uuid.uuid4().hex[:16]
         self._run_end_recorded = False
+        self._game_result = None
         self._run_seed = seed_value
         self._last_state_frame = state.frame
         self._last_restart_count = state.restart_count
@@ -288,10 +298,79 @@ class Controller:
         # The Lua bridge uses a threaded server. Serialize state transitions so
         # one request cannot clear an action while another request reads it.
         with self._state_lock:
-            return self._receive_state_unlocked(message)
+            response = self._receive_state_unlocked(message)
+            strategy = getattr(self, 'strategy_service', None)
+            if strategy is not None:
+                strategy.update(message, self._latest_state)
+                response = strategy.decorate_response(response, self._latest_state)
+                self._track_delivered_strategy_action(response)
+            now = time.monotonic()
+            key = tuple(message.get(k) for k in ("start_seed", "stage", "stage_type", "room_index", "room_clear", "restart_count"))
+            root = Path(self.log_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            if now - self._raw_state_at >= 1.0 or key != self._progress_key:
+                publish_json(root / "latest-raw-state.json",message)
+                self._raw_state_at = now
+            if key != self._progress_key:
+                self._experiment_recorder.record("game_progress", run_id=self._run_id,
+                    start_seed=message.get("start_seed"), stage=message.get("stage"),
+                    stage_type=message.get("stage_type"), room_index=message.get("room_index"),
+                    room_clear=message.get("room_clear"), frame=message.get("frame"),
+                    restart_count=message.get("restart_count"), player=message.get("player"))
+                self._progress_key = key
+            return response
+
+    def _track_delivered_strategy_action(self, response: dict[str, Any]) -> None:
+        # Progress feedback must describe the action delivered to Lua, including
+        # a strategic hold. A baseline proposal withheld while the model thinks
+        # is not an attempted path and must not become an unreachable pickup.
+        if not response.get('strategy', {}).get('owned'):
+            return
+        self._effective_action = Action(
+            action_id=response.get('id', ''), move=Vec2.from_value(response.get('move')),
+            shoot=Vec2.from_value(response.get('shoot')), mode=response.get('mode', ''),
+            source=response.get('source', ''), target=response.get('target', ''),
+            reason=response.get('reason', ''), issued_frame=response.get('issued_frame', -1),
+            expires_frame=response.get('expires_frame', -1),
+            waypoint=Vec2.from_value(response['waypoint']) if response.get('waypoint') else None,
+        )
+        signature = (response.get('source_room_index'), response.get('id'), response.get('mode'),
+                     response.get('target'), (response['strategy'].get('command') or {}).get('plan_id'))
+        if signature != self._delivered_signature:
+            self._delivered_signature = signature
+            self._delivered_sequence += 1
+        response['action_sequence'] = self._delivered_sequence
+        if response.get('mode') == 'strategy_hold':
+            self._pickup_target_id = -1
+            self._pickup_last_distance = None
+            self._movement_stall_count = 0
+
+    def receive_game_event(self, message: dict[str, Any]) -> None:
+        """Record the native MC_POST_GAME_END result; false means an ending."""
+        if message.get("callback") != "MC_POST_GAME_END" or type(message.get("is_game_over")) is not bool:
+            return
+        with self._state_lock, self._lock:
+            if self._latest_state is None or message.get("start_seed") != self._run_seed:
+                return
+            won = message["is_game_over"] is False
+            result = dict(message, result="victory" if won else "death", run_id=self._run_id)
+            self._game_result = result
+            self._experiment_recorder.record("native_game_end", **{k: v for k, v in result.items() if k != "type"})
+            root = Path(self.log_dir)
+            root.mkdir(parents=True, exist_ok=True)
+            with (root / "native-game-events.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(result, ensure_ascii=False) + "\n")
+            if won:
+                (root / "victory.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                self.autopilot_enabled = False
+                self._latest_action = None
+                self._stall_override = None
+                self._run_end_recorded = True
 
     def _receive_state_unlocked(self, message: dict[str, Any]) -> dict[str, Any]:
-        floor_key = (message.get("start_seed"), message.get("stage"), message.get("stage_type"), message.get("dimension"), message.get("floor_id"), message.get("restart_count", 0))
+        # Lua's retry counter resets on a Mod reload. Seed/stage/dimension and
+        # frame regression already identify real run and floor boundaries.
+        floor_key = (message.get("start_seed"), message.get("stage"), message.get("stage_type"), message.get("dimension"), message.get("floor_id"))
         frame = int(message.get("frame", 0))
         boundary = self._floor_key is not None and (floor_key != self._floor_key or frame < self._last_state_frame)
         if boundary:
@@ -338,7 +417,8 @@ class Controller:
         self._floor_key = floor_key
         if isinstance(message.get("layout"), dict):
             self._last_layout = RoomLayout.from_value(message["layout"])
-        elif self._last_layout.room_index >= 0:
+        elif (self._last_layout.room_index >= 0
+              or self._last_layout.room_type in {"devil", "angel"}):
             message = message | {"layout": {
                 "room_index": self._last_layout.room_index,
                 "room_type": self._last_layout.room_type,
@@ -346,16 +426,18 @@ class Controller:
                 "grid_width": self._last_layout.grid_width,
                 "grid_height": self._last_layout.grid_height,
                 "blocked": list(self._last_layout.blocked),
+                "shot_blocked": list(self._last_layout.shot_blocked) if self._last_layout.shot_blocked is not None else None,
                 "danger_grid_indices": list(self._last_layout.danger_grid_indices),
-                "grid_events": [{"kind": event.kind, "id": event.entity_id, "pos": event.position.__dict__, "grid_index": event.grid_index, "active": event.active, "triggered": event.triggered} for event in self._last_layout.grid_events],
+                "grid_events": [{"kind": event.kind, "id": event.entity_id, "pos": event.position.__dict__, "grid_index": event.grid_index, "active": event.active, "triggered": event.triggered, "timed": event.timed} for event in self._last_layout.grid_events],
                 "bomb_walls": [{"slot": wall.slot, "pos": wall.position.__dict__, "site": wall.site.__dict__, "grid_index": wall.grid_index, "room_type": wall.room_type, "bombed": wall.bombed} for wall in self._last_layout.bomb_walls],
                 "doors": [{"slot": door.slot, "pos": door.position.__dict__, "target_room_index": door.target_room_index, "target_is_boss": door.target_is_boss, "target_clear": door.target_clear, "target_room_type": door.target_room_type, "grid_index": door.grid_index, "door_locked": door.locked, "door_lock_known": door.lock_known, "door_open": door.open, "door_open_known": door.open_known} for door in self._last_layout.doors],
             }}
         room_index = self._last_layout.room_index
-        room_changed = room_index >= 0 and room_index != self._current_room_index
+        known_room = room_index >= 0 or self._last_layout.room_type in {"devil", "angel"}
+        room_changed = known_room and room_index != self._current_room_index
         if room_changed:
             self._boss_clear_observed_frame = -1
-            if self._current_room_index >= 0:
+            if self._current_room_index in self._visited_rooms:
                 self._room_failures[self._current_room_index] = (set(self._ignored_pickup_ids), set(self._ignored_hazard_ids))
                 if self._planned_goal == "backtrack to entry room":
                     self._backtrack_edges.add((self._current_room_index, room_index))
@@ -379,6 +461,9 @@ class Controller:
             self._hazard_target_id = -1
             self._hazard_last_distance = None
             self._hazard_last_progress_frame = 0
+            self._hazard_progress_by_target.clear()
+            self._hazard_animation_by_target.clear()
+            self._hazard_retry_after.clear()
             self._unreachable_targets.clear()
             self._effective_action = None
             self._last_response_signature = None
@@ -404,7 +489,7 @@ class Controller:
             self._door_retry_reasons = {edge: reason for edge, reason in self._door_retry_reasons.items() if edge[0] != room_index}
         self._room_failure_geometry[room_index] = self._last_layout.blocked
         self._expire_door_retries(frame)
-        if room_index >= 0:
+        if known_room:
             self._room_graph[room_index] = self._last_layout.doors
         if message.get("room_clear") and (self._last_layout.is_boss or self._last_layout.room_type == "boss"):
             reported_clear = message.get("room_cleared_frame")
@@ -475,6 +560,13 @@ class Controller:
                 self._ignored_pickup_ids.add(pickup.entity_id)
         self._last_held_trinkets = observed_state.held_trinkets
         self._update_hazard_progress(observed_state)
+        for target_id, retry_frame in tuple(self._hazard_retry_after.items()):
+            if observed_state.frame >= retry_frame:
+                self._hazard_retry_after.pop(target_id, None)
+                self._ignored_hazard_ids.discard(target_id)
+                self._hazard_progress_by_target.pop(target_id, None)
+                self._hazard_animation_by_target.pop(target_id, None)
+                self._last_decision_frame = -10_000
         self._clear_disappeared_pickup_action(observed_state)
         self._update_movement_feedback(observed_state)
         self._update_navigation_stall(observed_state)
@@ -890,7 +982,7 @@ class Controller:
             self._unreachable_targets = [target for target in self._unreachable_targets if target != marker]
 
     def _update_navigation_stall(self, state: GameState) -> None:
-        if state.move_resolution_reason == "recovery_waypoint_reached":
+        if state.move_resolution_reason in {"recovery_waypoint_reached", "timed_spike_wait"}:
             self._local_recovery_failures = 0
             self._stall_anchor = state.player.position
             self._stall_since_frame = state.frame
@@ -952,7 +1044,7 @@ class Controller:
 
     def _update_movement_feedback(self, state: GameState) -> None:
         """Count commands that request movement but produce no engine progress."""
-        if state.move_resolution_reason == "reverse_door_guard" or state.transition_gate == "reverse_guard":
+        if state.move_resolution_reason in {"reverse_door_guard", "timed_spike_wait"} or state.transition_gate == "reverse_guard":
             # The Mod intentionally pauses a just-used reverse door. This is
             # not evidence that the open door is physically unreachable.
             self._movement_stall_count = 0
@@ -1071,26 +1163,41 @@ class Controller:
             return
         distance = (hazard.position if hazard else tnt.position if tnt else wall.site).distance_to(state.player.position)
         hit_points = hazard.hit_points if hazard else 0.0
-        if target_id != self._hazard_target_id:
-            self._hazard_target_id = target_id
+        animation = hazard.animation if hazard else ""
+        previous_animation = self._hazard_animation_by_target.get(target_id)
+        self._hazard_animation_by_target[target_id] = animation
+        # Switching between adjacent targets is not progress. Keep each
+        # target's best distance and timer across those decision changes.
+        previous = self._hazard_progress_by_target.get(target_id)
+        self._hazard_target_id = target_id
+        if previous is None:
+            previous = (distance, hit_points, state.frame)
+        self._hazard_last_distance, self._hazard_last_hp, self._hazard_last_progress_frame = previous
+        if ((hazard is not None and hit_points < self._hazard_last_hp)
+                or distance < self._hazard_last_distance - 4
+                or (previous_animation is not None and animation != previous_animation)):
             self._hazard_last_distance = distance
-            self._hazard_last_progress_frame = state.frame
-            self._hazard_last_hp = hit_points
-        elif (hazard is not None and self._hazard_last_hp is not None and hit_points < self._hazard_last_hp) or self._hazard_last_distance is None or distance < self._hazard_last_distance - 4:
-            self._hazard_last_distance = distance
             self._hazard_last_hp = hit_points
             self._hazard_last_progress_frame = state.frame
-        elif self._target_move_blocked(state) and state.frame - self._hazard_last_progress_frame >= self._blocked_target_limit_frames():
-            self._mark_hazard_unreachable(target_id)
+        self._hazard_progress_by_target[target_id] = (
+            self._hazard_last_distance, self._hazard_last_hp, self._hazard_last_progress_frame)
+        if self._target_move_blocked(state) and state.frame - self._hazard_last_progress_frame >= self._blocked_target_limit_frames():
+            self._mark_hazard_unreachable(target_id, state)
         elif state.frame - self._hazard_last_progress_frame >= self._profile.pickup_stuck_frames:
-            self._mark_hazard_unreachable(target_id)
+            self._mark_hazard_unreachable(target_id, state)
 
-    def _mark_hazard_unreachable(self, target_id: int) -> None:
+    def _mark_hazard_unreachable(self, target_id: int, state: GameState | None = None) -> None:
         if target_id in self._ignored_hazard_ids:
             return
         # A destructible obstacle that makes no progress is unreachable from
         # the current firing lane; mark it and choose an exit.
         self._ignored_hazard_ids.add(target_id)
+        if (state is not None and not state.room_clear
+                and any(e.kind == "button" and e.active and not e.triggered for e in state.layout.grid_events)
+                and any(h.entity_id == target_id and h.kind in {"poop", "red_poop", "fire"} for h in state.hazards)):
+            # A moving trap can temporarily block a mandatory obstacle's lane.
+            # Try another target, then retry after the trap's phase changes.
+            self._hazard_retry_after[target_id] = state.frame + 180
         self._unreachable_targets.append(f"hazard:{target_id}")
         self._stale_actions_discarded += 1
         self._hazard_target_id = -1
@@ -1112,7 +1219,7 @@ class Controller:
 
     def _abandon_blocked_door(self, state: GameState) -> None:
         """Temporarily avoid a genuinely blocked threshold when another exit exists."""
-        if state.move_resolution_reason == "reverse_door_guard" or state.transition_gate == "reverse_guard":
+        if state.move_resolution_reason in {"reverse_door_guard", "timed_spike_wait"} or state.transition_gate == "reverse_guard":
             return
         action = self._effective_action or self._latest_action
         if not action or action.mode != "navigate" or (
@@ -1182,6 +1289,73 @@ class Controller:
             return True
 
         usable = [door for door in doors if is_usable(door)]
+        # A key acquired on another branch can unlock a previously observed
+        # treasure room. Visit that upgrade before taking the boss shortcut.
+        if state is not None and state.keys > 0 and not (0 < state.player.hit_points <= 3) and state.red_hearts >= state.max_hearts:
+            queue = [(self._current_room_index, -1)]
+            seen = {self._current_room_index}
+            while queue:
+                room, first = queue.pop(0)
+                edges = usable if room == self._current_room_index else self._room_graph.get(room, ())
+                for edge in edges:
+                    target = edge.target_room_index
+                    if not door_is_usable(edge, state) or (room, edge.slot, target) in self._unreachable_door_edges:
+                        continue
+                    slot = edge.slot if first < 0 else first
+                    if edge.target_room_type == "treasure" and target not in self._visited_rooms:
+                        return slot, ("known treasure room" if room == self._current_room_index
+                                      else "collect observed treasure upgrade before boss")
+                    if target not in seen and self._room_intel.get(target, {}).get("clear", edge.target_clear):
+                        seen.add(target)
+                        queue.append((target, slot))
+        # Return through cleared rooms to health actually seen on this floor.
+        if state is not None and (0 < state.player.hit_points <= 3 or state.max_hearts - state.red_hearts >= 2):
+            healing_kinds = {"soul_heart", "half_soul_heart", "black_heart"}
+            if state.red_hearts < state.max_hearts:
+                healing_kinds |= {"heart", "red_heart", "red_half_heart", "red_double_heart", "scared_heart", "blended_heart"}
+            targets = {room for room, intel in self._room_intel.items()
+                if room != self._current_room_index and intel.get("clear")
+                and intel.get("room_type") != "shop"
+                and healing_kinds.intersection(intel.get("reachable_rewards", intel.get("rewards", [])))}
+            queue = [(self._current_room_index, -1)]
+            seen = {self._current_room_index}
+            while queue and targets:
+                room, first = queue.pop(0)
+                edges = usable if room == self._current_room_index else self._room_graph.get(room, ())
+                for edge in edges:
+                    target = edge.target_room_index
+                    if target in seen or not door_is_usable(edge, state):
+                        continue
+                    if (room, edge.slot, target) in self._unreachable_door_edges:
+                        continue
+                    if not edge.target_clear and not self._room_intel.get(target, {}).get("clear"):
+                        continue
+                    slot = edge.slot if first < 0 else first
+                    if target in targets:
+                        return slot, "return to observed health pickup"
+                    seen.add(target)
+                    queue.append((target, slot))
+        # A boss discovered early must not silently skip the floor's upgrade.
+        # Search only ordinary branches while healthy and holding a key.
+        if (state is not None and 1 <= state.stage <= 6 and state.player.hit_points >= 6
+                and state.keys > 0 and not any(intel.get("room_type") == "treasure"
+                    for intel in self._room_intel.values())):
+            queue = [(self._current_room_index, -1)]
+            seen = {self._current_room_index}
+            while queue:
+                room, first = queue.pop(0)
+                edges = usable if room == self._current_room_index else self._room_graph.get(room, ())
+                for edge in edges:
+                    target = edge.target_room_index
+                    if (not door_is_usable(edge, state) or edge.target_is_boss
+                            or (room, edge.slot, target) in self._unreachable_door_edges):
+                        continue
+                    slot = edge.slot if first < 0 else first
+                    if target not in self._visited_rooms and edge.target_room_type in {"default", "unknown", "treasure"}:
+                        return slot, "search treasure upgrade before boss"
+                    if target not in seen and self._room_intel.get(target, {}).get("clear", edge.target_clear):
+                        seen.add(target)
+                        queue.append((target, slot))
         unexplored = [door for door in usable if door.target_room_index not in self._visited_rooms]
         opened_secret = newly_opened_secret_door(state) if state is not None else None
         if opened_secret and any(door.slot == opened_secret.slot for door in unexplored):
@@ -1197,7 +1371,7 @@ class Controller:
             return min(treasure, key=lambda door: door.slot).slot, "known treasure room"
         if self._committed_door_room == self._current_room_index:
             committed = next((door for door in doors if door.slot == self._committed_door_slot and is_usable(door)), None)
-            if committed is not None:
+            if committed is not None and committed.target_room_index not in self._visited_rooms:
                 return committed.slot, "committed navigation choice"
             self._committed_door_slot = -1
             self._committed_door_room = -1
@@ -1304,17 +1478,26 @@ class Controller:
         if room_index < 0:
             return
         rewards = []
+        reachable_rewards = []
         for pickup in state.pickups:
+            if pickup.entity_id in state.ignored_pickup_ids:
+                continue
+            reward = None
             if pickup.is_collectible:
-                rewards.append(f"item: {pickup.name} (quality {pickup.quality}, price {pickup.price})")
+                reward = f"item: {pickup.name} (quality {pickup.quality}, price {pickup.price})"
             elif pickup.pickup_kind in {"key", "coin", "bomb", "heart", "red_heart", "red_half_heart", "red_double_heart", "soul_heart", "half_soul_heart", "black_heart", "eternal_heart", "golden_heart", "bone_heart", "scared_heart", "blended_heart", "rotten_heart", "card", "pill", "trinket", "grab_bag"}:
-                rewards.append(pickup.pickup_kind)
+                reward = pickup.pickup_kind
+            if reward is not None:
+                rewards.append(reward)
+                if path_distance(state,pickup.position,pickup.grid_index) < float("inf"):
+                    reachable_rewards.append(reward)
         self._room_intel[room_index] = {
             "room_index": room_index,
             "clear": state.room_clear,
             "room_type": state.layout.room_type,
             "hazards": [{"id": hazard.entity_id, "kind": hazard.kind, "requires_bomb": hazard.requires_bomb} for hazard in state.hazards],
             "rewards": rewards,
+            "reachable_rewards": reachable_rewards,
             "doors": [
                 {"slot": door.slot, "target_room_index": door.target_room_index, "room_type": door.target_room_type, "boss": door.target_is_boss}
                 for door in state.layout.doors
@@ -1378,7 +1561,7 @@ class Controller:
             "latency_ms": decision.client_latency_ms,
             "client_latency_ms": decision.client_latency_ms,
             "server_latency_ms": decision.server_latency_ms,
-            "remote_latency_ms": decision.client_latency_ms if decision.provider in {"laya", "jev", "bocha", "systemone"} else None,
+            "remote_latency_ms": decision.client_latency_ms if decision.provider in {"jev", "bocha", "systemone"} else None,
             "request_bytes": decision.request_bytes,
             "estimated_input_tokens": decision.estimated_input_tokens,
             "candidate_set": candidate_set.as_dict(),
@@ -1419,7 +1602,7 @@ class Controller:
         }
         trace["policy"] = route
         trace["policy_route"] = route
-        remote_called = decision.provider in {"laya", "jev", "bocha", "systemone"} and decision.status not in {"local", "fallback_not_remote"} and decision.request_bytes > 0
+        remote_called = decision.provider in {"jev", "bocha", "systemone"} and decision.status not in {"local", "fallback_not_remote"} and decision.request_bytes > 0
         trace["remote_call"] = remote_called
         trace["phase"] = trace.get("candidate_set", {}).get("phase", "unknown")
         trace["state_age_seconds"] = max(0.0, time.monotonic() - self._last_state_at)
@@ -1436,7 +1619,7 @@ class Controller:
                 self._remote_call_count += 1
                 if state.recovery_active:
                     self._recovery_last_remote_frame = state.frame
-            if action.source not in {"jev", "laya"}:
+            if action.source not in {"jev"}:
                 self._local_decision_count += 1
             self._last_policy = decision.policy or route
             self._last_request_bytes = int(trace.get("request_bytes", 0) or 0)
@@ -1573,8 +1756,42 @@ class Controller:
         index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * percentile))))
         return ordered[index]
 
-    def status(self) -> dict[str, Any]:
+    def status(self, compact: bool = False) -> dict[str, Any]:
         with self._lock:
+            if compact:
+                state = self._latest_state
+                action = self._latest_action
+                return {
+                    "mod_version": state.mod_version if state else "not_connected",
+                    "autopilot_enabled": self.autopilot_enabled,
+                    "game_result": self._game_result,
+                    "run_seed": self._run_seed,
+                    "latest_frame": state.frame if state else None,
+                    "latest_action": action.action_id if action else None,
+                    "latest_reason": action.reason if action else None,
+                    "latest_source": action.source if action else None,
+                    "latest_move": action.move.__dict__ if action else None,
+                    "bridge_error": self._bridge_error,
+                    "remote_call_count": self._remote_call_count,
+                    "state_age_seconds": max(0.0, time.monotonic() - self._last_state_at) if self._last_state_at else None,
+                    "latest_state": {
+                        "room_clear": state.room_clear,
+                        "player_dead": state.player_dead,
+                        "restart_phase": state.restart_phase,
+                        "restart_count": state.restart_count,
+                        "restart_error": state.restart_error,
+                        "room_index": state.layout.room_index,
+                        "room_type": state.layout.room_type,
+                        "player_hp": state.player.hit_points,
+                        "player_position": state.player.position.__dict__,
+                        "combat_stuck": self._combat_stuck,
+                        "movement_blocked": state.movement_blocked,
+                        "move_resolution_reason": state.move_resolution_reason,
+                        "safe_move_directions": state.safe_move_directions,
+                        "planned_goal": self._planned_goal,
+                        "visited_rooms": sorted(self._visited_rooms),
+                    } if state else None,
+                }
             rules = decision_rules()
             rules["source_revisions"].update({
                 "Controller.receive_state": hashlib.sha1(inspect.getsource(Controller.receive_state).encode("utf-8")).hexdigest()[:12],
@@ -1584,6 +1801,7 @@ class Controller:
                 "controller_version": "2026-09-24-v19",
                 "mod_version": self._latest_state.mod_version if self._latest_state else "not_connected",
                 "autopilot_enabled": self.autopilot_enabled,
+                "game_result": self._game_result,
                 "decision_hz": self.decision_hz,
                 "macro_horizon_frames": self.macro_horizon_frames,
                 "macro_remaining_frames": max(0, self._latest_action.expires_frame - self._latest_state.frame) if self._latest_action and self._latest_state and self._latest_action.expires_frame >= 0 else 0,
@@ -1679,6 +1897,16 @@ class Controller:
                     "room_type": self._latest_state.layout.room_type,
                     "player_hp": self._latest_state.player.hit_points,
                     "player_position": self._latest_state.player.position.__dict__,
+                    "player_grid_index": self._latest_state.player_grid_index,
+                    "layout": {
+                        "grid_width": self._latest_state.layout.grid_width,
+                        "grid_height": self._latest_state.layout.grid_height,
+                        "blocked": sorted(self._latest_state.layout.blocked),
+                        "danger_grid_indices": sorted(self._latest_state.layout.danger_grid_indices),
+                        "doors": [{"slot": door.slot, "grid_index": door.grid_index,
+                                   "position": door.position.__dict__}
+                                  for door in self._latest_state.layout.doors],
+                    },
                     "enemies": len(self._latest_state.enemies),
                     "projectiles": len(self._latest_state.projectiles),
                     "tracking_threats": [
@@ -1727,14 +1955,14 @@ class Controller:
                 } if self._latest_state else None,
             }
 
-    def set_autopilot(self, enabled: bool) -> dict[str, Any]:
+    def set_autopilot(self, enabled: bool, compact: bool = False) -> dict[str, Any]:
         with self._lock:
             self.autopilot_enabled = enabled
             if not enabled:
                 self._latest_action = None
                 self._stall_override = None
                 self._stall_override_until_frame = -1
-            return self.status()
+            return self.status(compact=compact)
 
     def shutdown(self) -> None:
         if self._run_id and not self._run_end_recorded:
@@ -1764,6 +1992,9 @@ class _BridgeHandler(socketserver.StreamRequestHandler):
                     if not raw_line:
                         continue
                     message = json.loads(raw_line.decode("utf-8"))
+                    if message.get("type") == "game_event":
+                        runtime.controller.receive_game_event(message)
+                        continue
                     if message.get("type") != "state":
                         continue
                     response = runtime.controller.receive_state(message)

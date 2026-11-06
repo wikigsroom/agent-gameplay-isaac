@@ -13,7 +13,6 @@ from isaac_jev.models import Entity, GameState, Vec2
 from isaac_jev.providers import (
     DecisionProviderConfig,
     JevProvider,
-    LayaProvider,
     ProviderConfigError,
     ProviderConfigStore,
     ProviderSettings,
@@ -59,30 +58,7 @@ class ProviderConfigTests(unittest.TestCase):
             self.assertEqual(config.selected_provider, "local")
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["selected_provider"], "local")
 
-    def test_defaults_select_local(self):
-        config = ProviderConfigStore(Path("missing-provider-config.json"), environ={}).load()
-        self.assertEqual(config.selected_provider, "local")
-        self.assertEqual(config.providers["laya"].url, "http://127.0.0.1:8000/v1/decision")
-        self.assertEqual(config.providers["laya"].health_url, "http://127.0.0.1:8000/health")
-        self.assertEqual(config.providers["laya"].confidence_threshold, 0.5)
-        self.assertEqual(config.providers["jev"].confidence_threshold, 0.7)
 
-    def test_config_is_atomic_and_ignores_arbitrary_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "logs" / "decision_provider.json"
-            raw = {
-                "selected_provider": "jev",
-                "shadow_enabled": True,
-                "shadow_provider": "laya",
-                "providers": {"jev": {"api_key": "do-not-write", "headers": {"Authorization": "secret"}}},
-            }
-            store = ProviderConfigStore(path, environ={"TYPESAFE_API_KEY": "environment-secret"})
-            store.save(parse_provider_config(raw, store.environ))
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('"api_key": "do-not-write"', text)
-            self.assertNotIn("environment-secret", text)
-            self.assertNotIn("Authorization", text)
-            self.assertEqual(store.load().selected_provider, "jev")
 
     def test_config_persists_api_key_as_plaintext(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -133,15 +109,6 @@ class ProviderConfigTests(unittest.TestCase):
         self.assertNotIn("private-secret", json.dumps(public))
         self.assertNotIn("api_key_b64", json.dumps(config.persisted_dict()))
 
-    def test_config_validates_provider_shadow_and_url(self):
-        with self.assertRaises(ProviderConfigError):
-            parse_provider_config({"selected_provider": "unknown"})
-        with self.assertRaises(ProviderConfigError):
-            parse_provider_config({"selected_provider": "laya", "shadow_enabled": True, "shadow_provider": "laya"})
-        with self.assertRaises(ProviderConfigError):
-            parse_provider_config({"providers": {"laya": {"url": "file:///secret"}}})
-        with self.assertRaises(ProviderConfigError):
-            parse_provider_config({"providers": {"laya": {"timeout_seconds": 0}}})
 
 
 class ProviderContractTests(unittest.TestCase):
@@ -150,85 +117,17 @@ class ProviderContractTests(unittest.TestCase):
         self.candidate_set = build_candidate_set(self.state)
         self.action_id = self.candidate_set.admissible_candidates[0].action_id
         self.settings = ProviderSettings(
-            url="http://laya.test/v1/decision",
-            health_url="http://laya.test/health",
-            model="configured-laya",
+            url="http://decision.test/v1/decision",
+            health_url="http://decision.test/health",
+            model="configured-provider",
             timeout_seconds=0.75,
             confidence_threshold=0.5,
         )
 
-    def test_laya_success_returns_common_metrics_and_no_authorization(self):
-        captured = {}
 
-        def opener(request, timeout):
-            captured["request"] = request
-            captured["timeout"] = timeout
-            return FakeResponse({
-                "model": "laya-rl-agent",
-                "answers": {"next_action": {
-                    "choice": self.action_id,
-                    "confidence": 0.9,
-                    "probabilities": {self.action_id: 0.8, "other": 0.2},
-                }},
-                "latency_ms": 17.5,
-            })
 
-        result = LayaProvider(self.settings, opener=opener).choose(self.state, self.candidate_set)
-        self.assertEqual(result.status, "success")
-        self.assertEqual(result.provider, "laya")
-        self.assertEqual(result.model, "laya-rl-agent")
-        self.assertEqual(result.action.source, "laya")
-        self.assertEqual(result.server_latency_ms, 17.5)
-        self.assertAlmostEqual(result.margin, 0.6)
-        self.assertGreater(result.entropy, 0)
-        self.assertIsNone(captured["request"].get_header("Authorization"))
-        self.assertEqual(captured["timeout"], 0.75)
 
-    def test_invalid_choice_falls_back_to_local(self):
-        provider = LayaProvider(self.settings, opener=lambda *_args, **_kwargs: FakeResponse({
-            "answers": {"next_action": {"choice": "invented", "confidence": 1.0}}
-        }))
-        result = provider.choose(self.state, self.candidate_set)
-        self.assertTrue(result.fallback)
-        self.assertEqual(result.fallback_reason, "invalid_choice")
-        self.assertEqual(result.action.source, "local")
 
-    def test_low_confidence_falls_back_and_preserves_remote_observation(self):
-        provider = LayaProvider(self.settings, opener=lambda *_args, **_kwargs: FakeResponse({
-            "answers": {"next_action": {
-                "choice": self.action_id, "confidence": 0.49,
-                "probabilities": {self.action_id: 0.9, "other": 0.1},
-            }}
-        }))
-        result = provider.choose(self.state, self.candidate_set)
-        self.assertEqual(result.fallback_reason, "low_confidence")
-        self.assertEqual(result.selected_choice, self.action_id)
-        self.assertEqual(result.confidence, 0.49)
-        self.assertEqual(result.top1_probability, 0.9)
-        self.assertEqual(result.action.source, "local")
-
-    def test_timeout_and_http_error_are_distinguished(self):
-        timeout_provider = LayaProvider(self.settings, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(socket.timeout("late")))
-        timeout = timeout_provider.choose(self.state, self.candidate_set)
-        self.assertTrue(timeout.timed_out)
-        self.assertEqual(timeout.fallback_reason, "timeout")
-
-        http_provider = LayaProvider(self.settings, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            urllib.error.HTTPError(self.settings.url, 503, "down", {}, None)
-        ))
-        http = http_provider.choose(self.state, self.candidate_set)
-        self.assertFalse(http.timed_out)
-        self.assertEqual(http.fallback_reason, "http_error")
-
-    def test_http_error_keeps_sanitized_response_body_for_debugging(self):
-        error = urllib.error.HTTPError(
-            self.settings.url, 422, "unprocessable entity", {},
-            io.BytesIO(b'{"detail":"questions.action.choice.criteria needs at least 2 items"}'),
-        )
-        provider = LayaProvider(self.settings, opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(error))
-        result = provider.choose(self.state, self.candidate_set)
-        self.assertIn("HTTP Error 422", result.error)
-        self.assertIn("criteria needs at least 2 items", result.error)
 
     def test_single_admissible_action_skips_remote_provider(self):
         called = []
@@ -240,18 +139,6 @@ class ProviderContractTests(unittest.TestCase):
         self.assertFalse(result.fallback)
         self.assertEqual(called, [])
 
-    def test_health_check_uses_health_url_and_sanitizes_response(self):
-        captured = {}
-
-        def opener(request, timeout):
-            captured["url"] = request.full_url
-            return FakeResponse({"status": "ok", "model": "convaiinnovations/laya", "token": "hidden"})
-
-        health = LayaProvider(self.settings, opener=opener).health_check()
-        self.assertTrue(health.ok)
-        self.assertEqual(captured["url"], self.settings.health_url)
-        self.assertEqual(health.model, "convaiinnovations/laya")
-        self.assertNotIn("token", health.details)
 
     def test_post_only_endpoint_is_reported_as_reachable(self):
         settings = ProviderSettings("https://jev.test/v1/systemone", "", "jev-test", 0.75, 0.7)
@@ -498,8 +385,6 @@ class MultiQuestionProviderTests(unittest.TestCase):
                 provider.choose_questions({}, questions)
         self.assertEqual(calls, [])
 
-    def test_laya_keeps_single_choice_contract(self):
-        self.assertFalse(hasattr(LayaProvider(self.settings), "choose_questions"))
 
 
 if __name__ == "__main__":

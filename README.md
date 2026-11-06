@@ -1,228 +1,178 @@
-# Isaac Jev 
+# Agent Gameplay · Isaac
 
-面向 **The Binding of Isaac: Repentance** 的本地单人自动游玩演示。游戏内 Lua Mod 通过 Repentance API 读取结构化状态，Python 服务端在本机生成安全候选动作，并使用 Local 策略或可选的远程 Decision Provider 选择动作。
+**以撒 Repentance 的原生 Windows 自动游玩系统：本地负责实时控制，DSH 中的单个 agent 负责慢速策略选择。**
 
-项目不包含游戏本体、游戏资源或任何 API Key。它不是官方 Mod，也不隶属于 Valve、Steam、Nicalis、Edmund McMillen、TypeSafe 或 Bocha。
+[English](README.en.md) · [文档导航](docs/README.md) · [架构与接口](docs/ARCHITECTURE.md) · [能力边界](docs/CAPABILITIES.md) · [验证与证据](docs/VALIDATION.md) · [操作与排障](docs/OPERATIONS.md)
 
-> 这是实验性演示，不保证完成整局游戏。请使用独立存档和固定种子，不要用于联机、竞速、排行榜或其他会影响他人的环境。
+当前版本 **native130-dsh / 0.1.0**。实测游戏 **Repentance 1.7.9b，32 位 `isaac-ng.exe`**；原生 CPython 3.13.1、Node 24.22.1、官方 DSH 0.2.2-rc.1。其他游戏版本、Repentance+、Linux/macOS 尚未验证。
 
-## 功能概览
+## 实际可用情况
 
-- Repentance Lua Mod：采集房间、敌人、弹幕、奖励、门、危险格和玩家反馈。
-- Python 服务端：TCP 桥、动作生命周期、寻路、战斗候选、安全过滤和本地脱困。
-- Local Provider：不需要网络或 API Key，可直接运行。
-- 可选远程 Provider：Jev、Bocha、Laya、自托管 System One。
-- 本地网页仪表盘：查看实时状态、决策、Provider、调试日志和实验统计。
-- MCP stdio 控制面：查询状态、启停自动控制和紧急停止。
-- 脱敏轨迹、离线回放统计和有限的本地策略调参。
+| 层次 | 已验证内容 | 使用边界 |
+|---|---|---|
+| 本地实时控制 | 普通输入移动、射击、蓄力释放、躲弹、路线、地刺与炸弹撤离；本次真实录制经过 5 个房间 | 规则系统有覆盖盲区；本次 45 秒样本生命由 6 降到 4 半心，不能据此声称稳定通关 |
+| DSH 插件 | 官方宿主、单 agent、4 个工具、短编号绑定、上下文与预算复核 | 宿主就绪不等于模型接口可用 |
+| 模型与策略 | 此前在指定网关完成硬币拾取、换房及效果回执；12 类回放曾有 9/12 在 45 秒内合法提交 | 新网关切换后的即时检查返回 401；当前状态与后续复测见验证报告。合法提交率不代表决策质量或通关率 |
+| 存档与生命周期 | 只操作授权的第 3 槽；启动观察；显式启用；真实暂停确认；原存档哈希校验 | 不替用户选择或覆盖存档；必须建立本机基线，实际 `ReadOnly=false` 才允许启用 |
+| 回归 | 606 项 Python/Lua 测试；4 项独立 Node 绑定测试 | 回放、模拟环境与自然实机证据分别记录 |
 
-## 环境要求
+本版本的实时链路不调用 Jev，也不要求本地 GPU、Docker、WSL 或虚拟机。DSH 和游戏控制在本机运行，模型推理由你配置的服务承担；**选择纯本地模式时没有模型调用**。
 
-- Windows 10/11。
-- Steam 版 The Binding of Isaac: Rebirth 和 Repentance DLC。
-- Python 3.11 或更高版本；Windows 用户如果已安装 Python 3.12，推荐使用 Python 3.12。
-- PowerShell 7（运行文档中的 PowerShell 命令时）。
-- 游戏启动参数需要包含 `--luadebug`，以启用 Mod 使用的 LuaSocket 调试运行时。
+## 实机截图与录制
 
-Python 服务端只依赖标准库，不需要安装第三方运行时包。远程 Provider 是否可用取决于对应服务的地址、模型和账号权限。
+下图来自当前版本的真实游戏原生帧缓冲，GIF 为原速片段，未生成或伪造游戏画面。
 
-## 安装 Python 服务端
+![真实本地自动游玩片段，原速](docs/media/local-gameplay.gif)
 
-在项目根目录打开 PowerShell 7：
+[完整游戏录制 MP4](docs/media/local-gameplay.mp4) · [游戏截图](docs/media/gameplay-local.png) · [素材时间、模式与校验信息](docs/media/README.md)
+
+该录制运行于 **纯本地模式**，展示探索、换房与战斗。视频没有展示本次新网关的 DSH 判断，也没有展示一局通关。部分采样窗口游戏曾处于前台，另有连续后台帧推进，详见证据。
+
+![真实只读观察页面](docs/media/dashboard-local.png)
+
+## 方案如何工作
+
+```mermaid
+flowchart LR
+    G[游戏 / 普通输入与只读状态] --> N[原生 Lua 回调 / 逐帧安全与武器控制]
+    N <--> L[Python 本地控制 / 候选、缓存、效果确认]
+    L --> S[9532 策略 API / 状态与有效 offers]
+    S <--> D[官方 DSH + Isaac 插件 / 单个策略 agent]
+    D <--> M[你的模型服务 / gpt-6-luna]
+    D -->|offer_ref + 费用预算| S
+    S -->|身份、期限、资源、安全复核| L
+```
+
+本地控制持续处理即时战斗和危险，模型不会逐帧发方向键。出现有意义的策略机会后，本地构造可执行候选，附上生命、背包、资源、房间与机制信息。DSH 预取并绑定这一轮决策，agent 从 `A1`、`A2` 等候选中选择。插件将短编号恢复为真实上下文和幂等计划，再由本地执行器复核并转为普通游戏输入。
+
+**默认 45 秒是一次策略机会的判断期限，不是每 45 秒固定调用，也不是每 300 ms 重新做拾取/导航判断。** 可配置为 5–60 秒。非紧急主动可以在本地继续战斗时判断；需要立即保命的动作不能等待模型。地刺相位、蓄力时机与躲弹始终留在本地。超时或换房后旧授权失效。
+
+| 决策种类 | Agent 判断什么 | 本地负责什么 | 当前支持边界 |
+|---|---|---|---|
+| 1. 主动道具 | 是否值得消耗充能、何时保留 | 充能、角色状态、普通主动键及效果核验 | 已登记机制；只执行主动槽 0；紧急保命不依赖模型 |
+| 2. 一次性/重骰/传送主动 | 使用与保留、构筑损失 | 安全房间、库存身份、一次性输入 | D6/D20/D100 等已知子集；冲刺/复杂瞄准不开放 |
+| 3. 拾取与组合 | 取舍、选项组、主动替换、商店价格 | 寻路、实际支付、目标身份、拾取效果 | 能读完整背包；不是完整协同知识库 |
+| 4. 药丸 | 已识别效果是否适用 | 检查识别状态、支持表、口袋输入 | 不预揭示未知药丸；只执行口袋槽 0 |
+| 5. 塔罗牌/符文 | 即时收益与保留价值 | 卡牌身份、普通使用、传送后失效旧计划 | 已知子集；危险或未知效果拒绝 |
+| 6. 房间/楼层路线 | 下一房间、探索顺序与资源保留 | 门与地形寻路、战斗、正常出口 | 已发现地图及历史；选中可走路线不等于路线最优 |
+| 7. 天使房/恶魔房 | 构筑收益、生命交易取舍 | 费用语义、支付后余量、目标一致性 | 先支持普通 Isaac 已知生命类型；未知费用拒绝 |
+| 8. 炸弹开路 | 炸弹预算与收益 | 放置点、普通炸弹键、爆炸撤离 | 仅已构造且可执行的候选；存在隐藏房元数据优势，见下文 |
+| 9. 星象房 | 已发现房间是否值得进、是否保留钥匙 | 锁门支付与门口路径 | 跳过宝箱房不保证生成星象房 |
+| 10. 骰子房 | 根据点数决定是否触发 | 读可见点数、走上机关、检测重置 | 已知 1–6 点；自然实机覆盖不足 |
+| 11. 献祭房 | 当前收益是否值得再付一次血 | 只付一次、核对计数、重新判断 | 已知计数和普通 Isaac；不自动连续献祭 |
+| 12. 特殊地形 | 是否绕行、进入、投入资源 | 每帧地刺相位、危险预测、通行时机 | Agent 不承担几十毫秒级穿刺控制 |
+
+12 类的期限、触发条件、控制职责和测试覆盖详见 [能力矩阵](docs/CAPABILITIES.md)。这里的“支持”均指子集，不表示所有道具、房型和角色已覆盖。
+
+## 新机器安装
+
+### 1. 准备原生运行环境
+
+准备有权使用的游戏安装、原生 Windows 64 位、**CPython 3.13** 和 **Node >=24.9**。本次验证版本为 Python 3.13.1 / Node 24.22.1。不需要 CUDA 或 GPU 模型。安装过程不更改系统执行策略、不使用容器。
 
 ```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install -e .
+git clone git@github.com:wikigsroom/agent-gameplay-isaac.git
+cd agent-gameplay-isaac
+python -m pip install -r requirements-native.lock.txt
+Copy-Item config/decision_provider.example.json config/decision_provider.json
+python -B -X utf8 setup_dsh.py
 ```
 
-如果你安装的是其他 Python 3.11+ 版本，可将命令中的 `3.12` 替换为对应版本。先运行 `py -0p` 查看 Windows Python Launcher 已注册的版本；Python 3.10 及更低版本不满足本项目要求。
-
-## 安装 Mod
-
-1. 在 Steam 中打开游戏属性，将 `--luadebug` 加入启动选项。
-2. 将本项目目录中的相对路径 `./mods/IsaacJev` 整个复制到 Steam 游戏根目录下的相对路径 `./mods/IsaacJev`。Steam 游戏根目录就是包含 `isaac-ng.exe` 的 `The Binding of Isaac Rebirth` 目录。
-
-   ```text
-   <Steam游戏根目录>\mods\IsaacJev
-   ```
-
-   最终应能看到：
-
-   ```text
-   ...\mods\IsaacJev\main.lua
-   ...\mods\IsaacJev\metadata.xml
-   ```
-
-   也可以在项目根目录用 PowerShell 7 直接复制：
-
-   ```powershell
-   $gameRoot = Read-Host '请输入 Steam 游戏根目录（包含 isaac-ng.exe）'
-   $isaacMods = Join-Path $gameRoot 'mods'
-   Copy-Item -LiteralPath '.\mods\IsaacJev' -Destination $isaacMods -Recurse -Force
-   ```
-
-   如果你的 Steam 库安装在其他盘符，只需要修改 `$gameRoot`。复制完成后，游戏应能从相对路径 `./mods/IsaacJev` 读取 Mod；这个项目不使用 Documents 下的旧路径。
-
-3. 启动游戏，在 Mods 菜单启用 **Isaac Jev**。
-4. 每次更新 Mod 后，退出并重新启动游戏，确保 Lua 加载磁盘上的新版本。
-
-Mod 只负责游戏侧状态采集和输入执行；Python 服务端必须另外启动。
-
-## 启动服务端
-
-### 推荐方式：本地策略和网页仪表盘
-
-先启动 Python 服务端：
+DSH 使用仓库锁文件和 `npm ci --ignore-scripts` 安装。如果 PATH 中的 Node 过旧或 npm 不在同一目录，可指定原生路径：
 
 ```powershell
-.venv\Scripts\python.exe -m isaac_jev.cli --autopilot --web-dashboard --no-dashboard --open-dashboard
+python setup_dsh.py --node "C:\path\to\node.exe" --npm "C:\path\to\npm\bin\npm-cli.js"
 ```
 
-默认端口：
+### 2. 建立本机存档备份与配置
 
-- TCP 桥：`127.0.0.1:9528`
-- 网页仪表盘：<http://127.0.0.1:9529/>
-
-看到 `Isaac Jev bridge listening on 127.0.0.1:9528` 后，再进入游戏。网页仪表盘只监听回环地址，不应通过端口转发暴露到公网。
-
-也可以双击项目根目录的 `start_isaac_jev.cmd`。该脚本要求已经创建 `.venv` 并安装项目。
-
-### 只使用终端面板
+先正常退出游戏。以下是路径示例，必须换成自己的安装与真实存档目录。`--protected-root` 可重复传入，用于额外保护原 Steam `250900` 等完整目录；它必须与本次可写测试区分开。
 
 ```powershell
-.venv\Scripts\python.exe -m isaac_jev.cli --autopilot
+python configure_install.py --game-root "E:\Games\Isaac" --save-root "C:\Users\YOUR_USER\Documents\My Games\Binding of Isaac Repentance" --protected-root "D:\Steam\userdata\YOUR_ID\250900" --backup-root "E:\Backups\Isaac"
 ```
 
-关闭自动控制但保持桥接服务：
+脚本复制整个来源目录和空目录，核验 SHA-256，再创建本机配置与基线。来源不修改，已有配置不覆盖。可写测试区只排除明确的第 3 槽数据；额外保护区的所有 `.dat`（包括它的第 3 槽）仍受保护。已有第 3 槽时默认拒绝；仅在已确认该槽就是授权测试槽时使用 `--allow-existing-slot3`，它不会清空或重建存档。
+
+游戏关闭时在对应 `options.ini` 核实：
+
+```ini
+EnableMods=0
+EnableDebugConsole=0
+PauseOnFocusLost=0
+SteamCloud=0
+```
+
+这套方案保留六个 `mods/IsaacJev/` 源文件，使用 `--luadebug` 与原生桥在内存中加载**普通输入回调**，不执行 `RegisterMod`。因此 **不要在游戏 Mod 菜单额外启用 IsaacJev，也不需要另装 Jev/EID 等 Mod**。它不生成伤害、不修改角色属性、房间、解锁或存档。最终解锁资格仍由游戏判断，启动前必须核实实际 `ReadOnly=false`。
 
 ```powershell
-.venv\Scripts\python.exe -m isaac_jev.cli
+python sync_mod_sources.py --version native130
 ```
 
-### MCP 控制面
+### 3. 配置模型
 
 ```powershell
-.venv\Scripts\python.exe -m isaac_jev.mcp_server
+python configure_model.py --base-url "https://YOUR_GATEWAY/v1" --model gpt-6-luna
+python probe_model.py
 ```
 
-MCP 服务通过 stdio 提供 `autopilot_status`、`autopilot_enable`、`autopilot_disable`、`emergency_stop` 和 `latest_state`。它管理已经运行的本地控制器，不参与逐帧游戏决策。
+密钥通过隐藏输入保存到 `private/model.json`，本机桥 token 也在 `private/`。模型网关需要支持 OpenAI 风格对话、工具调用及流式响应；基础探测通过后，仍须测试官方 DSH 实际工具链。不要把密钥写进命令参数、README 或提交记录。示例服务地址不是可用公共服务。
 
-## 游戏内控制
-
-- 命令行必须带 `--autopilot`，Lua 才允许 Python 动作覆盖玩家输入。
-- 游戏内按 **F8** 切换自动控制和人工输入。
-- 服务端断开或动作超过约 0.75 秒没有更新时，Lua 会回退人工输入。
-- 远程 Provider 超时、报错、低置信度或返回非法动作时，控制器回退到本地安全策略。
-- 角色死亡后，控制器清空旧动作；Mod 会等待后尝试自动重新开始。
-
-第一次运行建议先不带 `--autopilot`，确认网页或终端能持续收到游戏帧，再在空房间测试 F8 和人工接管。
-
-## Provider 配置
-
-公开仓库只提交 `config/decision_provider.example.json`。第一次启动服务端时，如果 `config/decision_provider.json` 不存在，程序会自动创建一份不含密钥、默认使用 `local` Provider 的配置；该文件已经被 `.gitignore` 排除。
-
-如果希望启动前就填写远程 Provider，也可以手动从示例复制：
+### 4. 启动、观察、启用与暂停
 
 ```powershell
-Copy-Item -LiteralPath 'config/decision_provider.example.json' -Destination 'config/decision_provider.json'
+python launch_game.py
+# 等待载入，在普通菜单选择已授权的第 3 槽，进入正常房间。
+python manage_stack.py start
+python manage_stack.py status
 ```
 
-默认配置选择 `local`，不需要 API Key、不需要网络服务即可运行。需要远程 Provider 时，在网页“模型与实验”页或本地配置文件中填写地址、模型、鉴权开关和 API Key。
+`start` 默认观察并确认游戏暂停；DSH 冷启动可能需要数分钟，最多等待 300 秒。它不会因为服务重启自行恢复游戏。只读页面为 **http://127.0.0.1:9532/**，不会自动打开浏览器。
 
-支持的 Provider：
-
-| Provider | 用途 | 是否需要 API Key |
-| --- | --- | --- |
-| `local` | 进程内确定性策略 | 否 |
-| `jev` | 官方 Jev System One 端点 | 通常需要 |
-| `bocha` | Bocha Jev 端点 | 通常需要 |
-| `laya` | 用户自行部署的 Laya 服务 | 取决于部署方式 |
-| `systemone` | 用户自行部署的兼容服务 | 取决于部署方式 |
-
-示例中的 Laya 和 System One 地址使用 `127.0.0.1` 占位，不代表项目提供这些服务。远程服务地址和模型由用户自行确认。
-
-配置文件会以明文保存用户填写的 API Key，仅供本机使用。不要把它提交到 Git、复制到 Issue、日志或截图中。已经暴露过的 Key 必须在服务商处撤销，删除文件不能清除既有 Git 历史。
-
-## 日志、统计和调参
-
-运行时数据写入 `logs/`，默认不提交到 Git：
-
-- `episodes.jsonl`：脱敏的死亡轨迹。
-- `decision_traces.jsonl`：候选、过滤、延迟和结果摘要。
-- `experiment_runs.jsonl`：实验事件和增量统计。
-- `policy_profile.json`：本地策略调参结果。
-
-查看回放统计：
+确认继续这一槽后，选择一种模式：
 
 ```powershell
-.venv\Scripts\python.exe -m isaac_jev.replay --path logs/decision_traces.jsonl
+python manage_stack.py arm        # 本地实时控制 + DSH 策略
+python manage_stack.py arm-local  # 纯本地控制，关闭 DSH 自动判断
 ```
-
-根据已有死亡事件生成建议 profile：
 
 ```powershell
-.venv\Scripts\python.exe -m isaac_jev.tuning --log-dir logs
-.venv\Scripts\python.exe -m isaac_jev.tuning --log-dir logs --write
+python manage_stack.py pause      # 等待真实暂停、稳定帧确认
+python manage_stack.py stop       # 先暂停，再停止本套服务
+python manage_stack.py restart    # 重启后仍然观察，不自行继续
 ```
 
-日志只应包含脱敏观测摘要，不应包含 API Key、完整远程请求或完整响应。提交问题前请自行检查日志内容。
+两种模式都校验进程身份、授权第 3 槽、实际可写状态、原存档哈希与存活角色。不要把旧进程号当作授权。PowerShell 包装脚本为可选入口；系统策略阻止脚本时，直接使用上述 Python 命令，无需改变策略。不要同时启动旧版 autopilot 或监督器。
 
-## 测试
+## 插件、接口与可扩展性
 
-测试不连接 Steam 游戏或远程 Provider：
+| 工具 | 用途 |
+|---|---|
+| `isaac_get_decision` | 取得并绑定当前有效候选、剩余期限和上下文 |
+| `isaac_get_state` | 查询生命、背包、效果、地图、房间、资源、敌人、boss 等 13 个主题 |
+| `isaac_lookup` | 查询本地版本化道具、卡牌、领域规则；未知保持未知 |
+| `isaac_submit_plan` | 提交候选短编号、理由、四项显式资源预算和可选执行期限 |
+
+插件位于 [dsh-host/isaac-plugin](dsh-host/isaac-plugin/README.md)，可独立打包为 tgz，但必须配合本项目的状态/执行服务。每四轮轮换短会话，长期局内状态保存在本地缓存。Agent 没有终端、文件写入、任意 Lua、控制台或任意按键工具。接口及扩展步骤见 [架构](docs/ARCHITECTURE.md)。
+
+## 验证与局限
 
 ```powershell
-.venv\Scripts\python.exe -m compileall -q src
-.venv\Scripts\python.exe -m unittest discover -s tests -v
+python -B -X utf8 -m unittest discover -s tests -q
+node --test tests/test_dsh_binding.mjs
+python check-saves.py
 ```
 
-CI 只执行离线检查，不会启动游戏。实机验证需要安装游戏、启用 Mod、启动 `--luadebug`，并按上面的安装顺序操作。
+模型回放验证会独占 9532，必须先在暂停状态停止服务，再单独启动 DSH 宿主和回放验证，不能与真实控制器并行。具体步骤见 [操作说明](docs/OPERATIONS.md)。
 
-## 常见问题
+- 需要几百毫秒内反应的控制始终由本地承担；此前模型成功回放耗时约 6.9–33.2 秒，不能担任逐帧控制器。
+- 主动/口袋槽 0 可执行，其他槽可观察；复杂角色生命、未知费用、未知药丸及未登记机制保守拒绝。
+- 当前地图查询过滤未发现房间，但**旧开墙候选读取了相邻隐藏房的引擎元数据**，有信息优势；不能把相关演示称为纯视觉盲玩。
+- 回执 `observed` 只代表回放合法；`accepted` 只代表执行排队；`succeeded` 才有相应状态变化证据。不同层级不能互换。
+- 尚未完成跨种子多局 A/B 测试，未证明 DSH 比本地策略有显著通关率或决策质量提升。稀有房间自然样本仍需积累。
 
-### 网页显示无法连接控制器
+## 仓库组织与来源
 
-确认 Python 服务端正在运行，且端口 `9528` 没有被旧实例占用。只保留一个控制器进程后重新打开 <http://127.0.0.1:9529/>。
+`src/isaac_jev/` 为本地控制与策略服务；`mods/IsaacJev/` 为游戏侧源码；`dsh-host/isaac-plugin/` 为 DSH 插件；`tests/` 为回归与标注回放；`docs/` 为双语说明、审查后的截图/视频与脱敏证据。运行数据、密钥、存档、完整会话、依赖目录和旧试验权重均不入库。
 
-### 游戏没有收到状态
-
-确认游戏启动参数包含 `--luadebug`，Mod 路径下存在 `main.lua`，并且在 Mods 菜单启用了 **Isaac Jev**。更新 Mod 后必须重启游戏。
-
-### 游戏能连接但没有自动动作
-
-确认服务端命令包含 `--autopilot`，并且游戏内没有按 F8 切换到人工模式。先使用 Local Provider 排除远程服务问题。
-
-### 远程 Provider 报缺少密钥
-
-确认本机 `config/decision_provider.json` 中对应 Provider 的 `auth_required` 和 `api_key` 已正确填写。不要把密钥写入示例文件或提交到仓库。
-
-### 角色卡在门口或持续重定位
-
-这是实验性策略的已知边界。保存脱敏日志和游戏帧信息后提交 Issue，说明 Mod 版本、控制器版本、Provider、固定种子和房间情况；不要上传存档或密钥。
-
-## 目录结构
-
-```text
-config/
-  decision_provider.example.json   # 可公开的配置模板
-mods/IsaacJev/                 # 复制到游戏 mods 目录
-src/isaac_jev/                # Python 服务端
-tests/                             # 离线测试
-ISAAC_RULES.md                     # 决策与安全规则
-PROJECT_MEMORY.md                  # 项目维护上下文
-start_isaac_jev.cmd                # Windows 启动脚本
-```
-
-## 安全与限制
-
-- 仅用于本地单人实验，不用于联机、竞速、排行榜或他人存档。
-- 不要向公网暴露 TCP 桥或网页仪表盘。
-- 不要提交 API Key、日志、存档、截图中的个人路径或远程服务响应。
-- 远程模型只是在安全候选集合中选择动作；本地碰撞、危险格、资源和过期动作检查仍拥有最终执行权。
-- 本项目不保证完成整局游戏，也不保证对所有房间布局、角色和道具组合都有效。
-
-## 许可证
-
-项目代码使用 [MIT License](LICENSE)。游戏本体、游戏资源、名称和商标仍属于其各自权利人；本项目不重新分发游戏本体或官方资源。
-
-欢迎通过 [CONTRIBUTING.md](CONTRIBUTING.md) 提交改进。安全问题请阅读 [SECURITY.md](SECURITY.md)。
+本项目在 [chongchong59699/isaac-jev](https://github.com/chongchong59699/isaac-jev) 基础上发展，保留 MIT 许可证及原作者署名。`isaac_jev` / `IsaacJev` 名称为接口兼容而保留。游戏及其美术不在本仓库分发，媒体仅为实机演示；需要自行提供游戏。依赖由各自许可证约束。见 [LICENSE](LICENSE)、[变更记录](CHANGELOG.md)、[贡献指南](CONTRIBUTING.md) 与 [安全说明](SECURITY.md)。
