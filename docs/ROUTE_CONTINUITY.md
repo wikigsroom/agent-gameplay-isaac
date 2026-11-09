@@ -60,3 +60,6 @@ Current genuine failures still stop normally. Recording/drink resume guards
 remain strict; hosts cannot adopt another owner's pause.
 
 The existing observed stage-eight Devil Room trapdoor toward Sheol is retained for the Satan run goal. Other Devil Rooms are not assumed to provide that route. Exit-obstruction checks retain the moving-spike veto; inert pedestal/retracted-spike markers still use actual path geometry and native collision guards.
+
+
+The native bundle also exposes a fixed `NativeRefreshObservation` hook. It only requests the existing full native observation/TCP exchange when simulation/Mod callbacks are quiet. Its acknowledgment never certifies freshness, resumes input, changes an authorization lease or clears an ordinary pause. The consumer polls only before its existing stale deadline; real state loss still stops. No game/save values are changed.
