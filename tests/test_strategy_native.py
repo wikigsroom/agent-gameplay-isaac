@@ -83,8 +83,67 @@ class NativeStrategyTests(unittest.TestCase):
         self.assertIsNone(self.control.pauseRequest)
         self.lua.globals().now=6501;self.control.render(self.control)
         self.assertEqual(self.control.pauseRequest.id,'controller-lease-expired')
+        self.assertTrue(self.control.pauseInput(self.control,1,18))
         self.lua.globals().paused=True;self.control.render(self.control)
         self.assertTrue(self.control.pauseAck.paused);self.assertIsNone(self.control.pauseRequest)
+
+    def test_boss_intro_is_not_acknowledged_as_an_ordinary_pause(self):
+        self.lua.globals().paused=True
+        self.control.requestPause(self.control,'during-intro');self.control.render(self.control)
+        self.assertIsNone(self.control.pauseAck)
+        self.assertTrue(self.control.pauseHold)
+        self.assertIsNone(self.control.pauseInput(self.control,1,18))
+        self.lua.globals().now=5000;self.control.render(self.control)
+        self.assertIsNone(self.control.pauseAck)
+        self.lua.globals().paused=False;self.control.render(self.control)
+        self.assertTrue(self.control.pauseInput(self.control,1,18))
+        self.lua.globals().paused=True;self.control.render(self.control)
+        self.assertEqual(self.control.pauseAck.id,'during-intro')
+        self.assertTrue(self.control.pauseAck.ordinary_pause_input_issued)
+
+    def test_loading_end_only_grants_a_fresh_observation_handoff_not_an_input_lease(self):
+        self.accept();self.control.render(self.control)
+        lease=self.control.leaseUntil
+        self.lua.globals().paused=True;self.lua.globals().now=2000;self.control.render(self.control)
+        self.lua.globals().now=9000;self.control.render(self.control)
+        self.assertIsNone(self.control.pauseRequest)
+        self.lua.globals().paused=False
+        self.assertTrue(self.control.render(self.control))
+        self.assertEqual(self.control.leaseUntil,lease)
+        self.assertFalse(self.filter()[1])
+        self.lua.globals().now=9400;self.control.render(self.control);self.assertIsNone(self.control.pauseRequest)
+        self.lua.globals().now=9501;self.control.render(self.control)
+        self.assertEqual(self.control.pauseRequest.id,'controller-lease-expired')
+
+    def test_new_room_handoff_is_not_renewed_by_repeated_renders(self):
+        self.accept();self.control.render(self.control)
+        self.lua.execute('game.GetLevel=function() return {GetStage=function() return 2 end,GetStageType=function() return 0 end,GetCurrentRoomIndex=function() return 84 end} end')
+        self.lua.globals().now=9000;self.control.render(self.control);self.assertIsNone(self.control.pauseRequest)
+        self.lua.globals().now=9400;self.control.render(self.control)
+        self.assertEqual(self.control.observationHandoffUntil,9500)
+        self.lua.globals().now=9501;self.control.render(self.control)
+        self.assertEqual(self.control.pauseRequest.id,'controller-lease-expired')
+
+    def test_disabled_engine_controls_send_heartbeat_without_renewing_expired_items(self):
+        self.accept();lease=self.control.leaseUntil
+        self.lua.execute('Isaac.GetPlayer=function() return {ControlsEnabled=false} end')
+        self.lua.globals().now=9000;self.assertTrue(self.control.render(self.control))
+        self.assertIsNone(self.control.pauseRequest);self.assertEqual(self.control.leaseUntil,lease)
+        self.assertFalse(self.filter()[1])
+
+    def test_a_transient_pause_end_retries_without_a_stale_input_or_auto_resume(self):
+        self.control.requestPause(self.control,'first')
+        self.assertTrue(self.control.pauseInput(self.control,1,18))
+        self.lua.globals().paused=True;self.control.render(self.control)
+        self.lua.globals().paused=False;self.lua.globals().now=10000;self.control.render(self.control)
+        self.assertIsNone(self.control.pauseAck)
+        self.assertEqual(self.control.pauseRequest.id,'first')
+        self.assertTrue(self.control.pauseInput(self.control,1,18))
+        self.lua.globals().paused=True;self.control.render(self.control)
+        self.assertTrue(self.control.pauseHold)
+        self.control.resumePauseHold(self.control)
+        self.assertFalse(self.control.pauseHold)
+        self.assertIsNone(self.control.pauseRequest);self.assertIsNone(self.control.pauseAck)
 
     def test_dice_floor_is_blocked_until_matching_live_entity_is_authorized(self):
         self.lua.execute('''
@@ -114,5 +173,33 @@ class NativeStrategyTests(unittest.TestCase):
         self.lua.globals().item=347;self.lua.globals().charge=0;self.accept()
         self.assertTrue(self.filter()[1]);self.lua.globals().item=0
         self.assertFalse(self.control.utilityAllowed(self.control,self.lua.globals().player,1))
+
+    def test_consumed_empty_pedestal_does_not_overwrite_the_accepted_command_ack(self):
+        target=self.lua.table_from({'id':7,'spawn_seed':7007,'type':5,'variant':100,'subtype':367,'price':0})
+        self.accept('select_pickup',target=target)
+        collider=self.lua.eval('{ToPlayer=function() return player end}')
+        pickup=self.lua.table_from({'Index':7,'InitSeed':7007,'Type':5,'Variant':100,'SubType':367,'Price':0})
+        self.assertIsNone(self.control.pickupCollision(self.control,pickup,collider))
+        pickup.SubType=0
+        self.assertTrue(self.control.pickupCollision(self.control,pickup,collider))
+        self.assertEqual(self.control.ack.status,'accepted');self.assertEqual(self.control.ack.plan_id,'one')
+
+    def test_new_nonempty_item_or_reused_empty_entity_still_rejects_the_old_target(self):
+        for seed,subtype in [(7007,368),(7008,0)]:
+            with self.subTest(seed=seed,subtype=subtype):
+                target=self.lua.table_from({'id':7,'spawn_seed':7007,'type':5,'variant':100,'subtype':367,'price':0})
+                self.control.seen=self.lua.table();self.accept('select_pickup',target=target)
+                collider=self.lua.eval('{ToPlayer=function() return player end}')
+                pickup=self.lua.table_from({'Index':7,'InitSeed':seed,'Type':5,'Variant':100,'SubType':subtype,'Price':0})
+                self.assertTrue(self.control.pickupCollision(self.control,pickup,collider))
+                self.assertEqual(self.control.ack.status,'rejected')
+
+    def test_a_changed_price_still_blocks_a_nonempty_authorized_pedestal(self):
+        target=self.lua.table_from({'id':7,'spawn_seed':7007,'type':5,'variant':100,'subtype':367,'price':0})
+        self.accept('select_pickup',target=target)
+        collider=self.lua.eval('{ToPlayer=function() return player end}')
+        pickup=self.lua.table_from({'Index':7,'InitSeed':7007,'Type':5,'Variant':100,'SubType':367,'Price':15})
+        self.assertTrue(self.control.pickupCollision(self.control,pickup,collider))
+        self.assertEqual(self.control.ack.status,'rejected')
 
 if __name__=='__main__':unittest.main()

@@ -257,14 +257,26 @@ function M.new(game)
         return math.max(72,(entity.Size or 40)+(player.Size or 10)+16)
     end
     function self:requestPause(id)
+        self.pauseHold=true
+        self.pauseHoldId=id
+        self.pauseAck=nil
         self.pauseRequest={id=id,requested=Isaac.GetTime()};return true
+    end
+    function self:resumePauseHold()
+        -- Only the host's guarded, explicit ordinary resume releases this latch.
+        self.pauseHold=false;self.pauseHoldId=nil;self.pauseRequest=nil;self.pauseAck=nil
     end
     function self:pickupCollision(pickup,collider)
         if not self.owned or self.manualOverride or not collider:ToPlayer() then return nil end
-        if self.hold or Isaac.GetTime()>self.leaseUntil then return true end
+        if self.pauseHold or self.hold or Isaac.GetTime()>self.leaseUntil then return true end
         local target=self.target
         if not target then return true end
         if pickup.Index~=target.id then return true end
+        -- The game invokes the collision hook again on the consumed, empty
+        -- collectible pedestal. Block it, but preserve the prior command ack;
+        -- only the host's actual inventory delta can prove acquisition.
+        if pickup.InitSeed==target.spawn_seed and pickup.Type==target.type and pickup.Variant==target.variant
+            and target.type==5 and target.variant==100 and target.subtype>0 and pickup.SubType==0 then return true end
         if pickup.InitSeed~=target.spawn_seed or pickup.Type~=target.type or pickup.Variant~=target.variant
             or pickup.SubType~=target.subtype or pickup.Price~=target.price then
             self.ack={plan_id=self.ack and self.ack.plan_id,status='rejected',reason='pickup changed at native collision'}
@@ -273,10 +285,21 @@ function M.new(game)
         return nil
     end
     function self:pauseInput(inputHook,button)
+        if self.pauseHold and not self.game:IsPaused() then
+            for _,name in ipairs({'ACTION_LEFT','ACTION_RIGHT','ACTION_UP','ACTION_DOWN',
+                'ACTION_SHOOTLEFT','ACTION_SHOOTRIGHT','ACTION_SHOOTUP','ACTION_SHOOTDOWN',
+                'ACTION_ITEM','ACTION_PILLCARD','ACTION_DROP','ACTION_BOMB'}) do
+                if ButtonAction[name] and button==ButtonAction[name] then
+                    if inputHook==InputHook.GET_ACTION_VALUE then return 0.0 end
+                    return false
+                end
+            end
+        end
         local request=self.pauseRequest
         if not request or self.game:IsPaused() then return nil end
         if Isaac.GetTime()-request.requested>1500 then return nil end
         if ButtonAction.ACTION_PAUSE and button==ButtonAction.ACTION_PAUSE then
+            request.input_issued_at=Isaac.GetTime()
             if inputHook==InputHook.GET_ACTION_VALUE then return 1.0 end
             return true
         end
@@ -286,15 +309,40 @@ function M.new(game)
         -- Utility authorization expires after 1.5 s. Allow the real-time
         -- combat owner its existing five-second disconnect window, including
         -- an occasional slow room-clear update, before requesting a pause.
-        if self.owned and not self.manualOverride and Isaac.GetTime()>self.leaseUntil+3500 and not self.game:IsPaused()
-            and not self.pauseRequest then
+        local now=Isaac.GetTime()
+        local paused,key=self.game:IsPaused(),self:key()
+        local controlsOk,controls=pcall(function() return Isaac.GetPlayer(0).ControlsEnabled end)
+        local engineHeld=paused or (controlsOk and controls==false)
+        -- A real engine pause/identity transition may finish after Lua callbacks
+        -- were suspended during loading. Give the first fresh observation/reply
+        -- half a second to arrive. Never renew leaseUntil or replay an old item
+        -- command, and never release an explicitly requested pause latch.
+        local handoffStarted=(self.renderKey and self.renderKey~=key) or (self.engineHeld==true and not engineHeld)
+        if handoffStarted then
+            self.observationHandoffUntil=now+500
+        end
+        self.renderKey,self.engineHeld=key,engineHeld
+        if self.owned and not self.manualOverride and now>self.leaseUntil+3500
+            and not engineHeld and now>(self.observationHandoffUntil or 0) and not self.pauseHold then
             self:requestPause('controller-lease-expired')
         end
-        if self.pauseRequest and self.game:IsPaused() then
-            self.pauseAck={id=self.pauseRequest.id,paused=true,frame=game:GetFrameCount(),observed_at=Isaac.GetTime()}
+        if self.pauseHold and not self.game:IsPaused() and not self.pauseRequest then
+            self.pauseAck=nil
+            self.pauseRequest={id=self.pauseHoldId,requested=now}
+        end
+        if self.pauseRequest and not self.game:IsPaused() and now-self.pauseRequest.requested>1500 then
+            self.pauseRequest.requested=now;self.pauseRequest.input_issued_at=nil
+        end
+        -- IsPaused also includes boss intros, transitions and big-book animations.
+        -- A stable simulation frame alone cannot acknowledge a pause request.
+        if self.pauseRequest and self.game:IsPaused() and self.pauseRequest.input_issued_at then
+            self.pauseAck={id=self.pauseRequest.id,paused=true,frame=game:GetFrameCount(),observed_at=now,
+                ordinary_pause_input_issued=true,input_issued_at=self.pauseRequest.input_issued_at}
             self.pauseRequest=nil
         end
-        if self.game:IsPaused() and Isaac.GetTime()-self.lastRenderAt>400 then self.lastRenderAt=Isaac.GetTime();return true end
+        if handoffStarted or ((engineHeld or now<=(self.observationHandoffUntil or 0)) and now-self.lastRenderAt>400) then
+            self.lastRenderAt=now;return true
+        end
         return false
     end
     return self
