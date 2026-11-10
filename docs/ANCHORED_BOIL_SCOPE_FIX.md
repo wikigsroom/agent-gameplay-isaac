@@ -7,3 +7,6 @@
 完成本轮全部审阅提交后，重新冻结六组完整验证及独立方案仓库验证。通过后保留当前PID/种子实机确认：剩余固定敌人确实被正常输入消灭、原生房间清空，随后继续跨房或下楼；不把进程健康或帧推进作为成功。若实机还有缺口，保持失败记录并修复，不虚报脱困。
 
 达到本次修复核验后，先撤回持续运行/自动恢复授权，再正常关闭公开推流与本项目程序；通过进程创建时间、可执行文件及本项目归属清单核对所有关闭目标，保留其他任务。游戏采用正常退出途径保存槽3进度；不改槽1/2、旧备份及Steam数据。记录停止前后项目进程、系统可用内存、显存占用和实际平台live_status。所有密钥、参考声音和原始会话保持私有。本文件创建时最终测试、实机清房及结束运行回执待核验。
+
+
+CYCLE44 finished complete verification and passed full native compilation and the new motion replays, but an isolated legacy pickup replay included the adjacent mod method. CYCLE45 narrows that extraction to pickupTable itself. Production logic is identical, and the complete frozen Python and Node verification runs again. A transient Windows 10053 loopback error from CYCLE44 is retained in its logs.
