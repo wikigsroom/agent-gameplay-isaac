@@ -11,3 +11,6 @@ CYCLE41已真实清掉80号房并进入后续五个房间，冻结六组1313项�
 准入仅为原生type30/variant0的固定Boil炮台增加受击击退速度例外，保留220单位距离、预测近弹、无地面危险、模型空闲、无人接管、无战略执行和连续10秒观察要求；其他移动敌人仍拒绝。否则零伤害射击可永远让炮台带击退速度，导致修复自身等不到静止。活游戏始终保留原生安全回调和所有不中断规则，不自动暂停/结束游戏。
 
 完成全部实现、审阅提交后冻结为CYCLE42统一六组测试，测试开始后不穿插生产补丁。随后必须实机清掉78号房剩余敌人并继续跨房/层；同时保留原seed/PID、NCM01/OmniVoice、512×512/25FPS口型、原Luna人格/历史/wiki。本文写入时尚无本轮测试或实机恢复回执，不能提前称通过。
+
+
+CYCLE42 closed: 687 Python and four Node checks passed, native range160 was deployed, but nine live Boils still blocked room78. [CYCLE43](ANCHORED_BOIL_MOTION.md) corrects anchored-body forecasts; no CYCLE42 source was edited during its frozen tests.
