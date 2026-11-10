@@ -87,6 +87,23 @@ class NativeStrategyTests(unittest.TestCase):
         self.lua.globals().paused=True;self.control.render(self.control)
         self.assertTrue(self.control.pauseAck.paused);self.assertIsNone(self.control.pauseRequest)
 
+    def test_continuous_embedding_never_pauses_when_the_controller_lease_expires(self):
+        self.lua.globals().ISAAC_ALLOW_AUTOMATIC_GAME_PAUSE=False
+        self.accept();self.lua.globals().now=3000;self.control.render(self.control)
+        self.lua.globals().now=6501;self.control.render(self.control)
+        self.assertIsNone(self.control.pauseRequest)
+        self.assertFalse(self.control.pauseHold)
+        self.assertIsNone(self.control.pauseInput(self.control,1,18))
+        self.assertFalse(self.filter()[1])
+
+    def test_continuous_embedding_preserves_explicit_operator_pause(self):
+        self.lua.globals().ISAAC_ALLOW_AUTOMATIC_GAME_PAUSE=False
+        self.assertEqual(self.control.requestPause(self.control,'automatic'), 'automatic_pause_forbidden')
+        self.assertTrue(self.control.requestPause(self.control,'operator',True))
+        self.assertTrue(self.control.pauseInput(self.control,1,18))
+        self.lua.globals().paused=True;self.control.render(self.control)
+        self.assertEqual(self.control.pauseAck.id,'operator')
+
     def test_boss_intro_is_not_acknowledged_as_an_ordinary_pause(self):
         self.lua.globals().paused=True
         self.control.requestPause(self.control,'during-intro');self.control.render(self.control)
