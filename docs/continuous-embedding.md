@@ -15,7 +15,8 @@ With the flag absent or true, the existing standalone safe-pause behavior is
 unchanged. This is an opt-in integration policy, not a change to standalone
 startup or save protection. No credentials, model service, game values or saves
 are included or altered.
-# Input admission and observation
+
+## Input admission and observation
 
 An embedding that waits for its DSH host or other startup checks should create
 `Controller(require_enabled_action_feedback=True)`. Observation still updates
@@ -24,4 +25,3 @@ pickup, hazard or door attempts. Changing input authority resets only ongoing
 feedback timers; real prior unreachable targets remain recorded. Enabled
 attempts still use the ordinary no-progress limits. The standalone default
 remains compatible with existing diagnostic replays.
-
