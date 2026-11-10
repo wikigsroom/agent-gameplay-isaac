@@ -7,3 +7,5 @@ The Python firing-lane planner admitted the current tile using nominal TearRange
 `firing_position` now caps the lane range at the native planner's existing 235-unit ceiling. Shorter nominal ranges retain their lower bound. This creates a reachable cardinal waypoint around the pits, preserved by the ordinary movement-penalty path. No game statistics, saves, pickups or model ownership change.
 
 The sanitized observed layout is `tests/fixtures/stage3-pit-range-stall.json`; the regression exercises real candidate generation and reachable waypoints. Offline replay and a live room clear must be reported separately. This patch does not prove coverage of every item combination or a complete run.
+
+Independent repository validation note: the first synchronization candidate (40db83d) imported an integration-only observation cache and failed module loading. The corrected independent candidate applies the same range fix to its own navigation baseline, preserving its separate dependency surface. Re-run the entire independent Python and Node suites against the new committed candidate; the failed run remains historical evidence.

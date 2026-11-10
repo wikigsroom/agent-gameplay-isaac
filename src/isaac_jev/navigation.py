@@ -4,7 +4,6 @@ import heapq
 from dataclasses import replace
 
 from .models import Door, GameState, Vec2
-from .observation_cache import observation_memo
 
 
 def _path_blocked(state: GameState) -> frozenset[int]:
@@ -61,16 +60,6 @@ def path_distance(state: GameState, target: Vec2, target_grid_index: int, *, all
     layout = state.layout
     if not layout.grid_width or not layout.grid_height or target_grid_index < 0 or state.player_grid_index < 0:
         return target.distance_to(state.player.position)
-    distances = observation_memo('route_distances', (state,), (allow_timed,),
-                                 lambda: _route_distances(state, allow_timed))
-    distance = distances.get(target_grid_index)
-    if distance is None:
-        return float("inf")
-    return distance * 40.0 + (target.distance_to(state.player.position) if distance == 0 else 0.0)
-
-
-def _route_distances(state: GameState, allow_timed: bool) -> dict[int, int]:
-    layout = state.layout
     start = state.player_grid_index
     blocked = _path_blocked(state)
     if allow_timed:
@@ -79,13 +68,15 @@ def _route_distances(state: GameState, allow_timed: bool) -> dict[int, int]:
         blocked -= frozenset(event.grid_index for event in layout.grid_events
                              if event.kind == 'spike' and event.timed)
     queue = [(start, 0)]
-    distances = {start: 0}
+    seen = {start}
     for current, distance in queue:
+        if current == target_grid_index:
+            return distance * 40.0 + (target.distance_to(state.player.position) if distance == 0 else 0.0)
         for neighbor in _neighbors(current, layout.grid_width, layout.grid_height):
-            if neighbor not in distances and neighbor not in blocked:
-                distances[neighbor] = distance + 1
+            if neighbor not in seen and neighbor not in blocked:
+                seen.add(neighbor)
                 queue.append((neighbor, distance + 1))
-    return distances
+    return float("inf")
 
 
 def door_path_distance(state: GameState, door: Door) -> float:
@@ -151,9 +142,7 @@ def firing_position(state: GameState, target: Vec2, target_grid_index: int,
                     firing_axis: str | None = None) -> tuple[Vec2, int, Vec2] | None:
     """Find a reachable cardinal firing lane inside the player's tear range."""
     layout = state.layout
-    # Match predictiveCombatMove's 235-unit native engagement ceiling. A
-    # longer nominal TearRange must not let Python keep the current tile as
-    # its firing waypoint while Lua cannot approach across an intervening pit.
+    # Keep the lane inside the native predictiveCombatMove engagement ceiling.
     maximum_range = max(0.0, min(235.0, state.player.tear_range - 25.0))
     if maximum_range < minimum_range:
         return None
