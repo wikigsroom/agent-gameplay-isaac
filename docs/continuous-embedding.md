@@ -25,3 +25,10 @@ pickup, hazard or door attempts. Changing input authority resets only ongoing
 feedback timers; real prior unreachable targets remain recorded. Enabled
 attempts still use the ordinary no-progress limits. The standalone default
 remains compatible with existing diagnostic replays.
+
+For slower strategic hosts, an embedding may explicitly construct
+`StrategyService(decision_seconds=120,max_decision_seconds=120,renew_expired_decisions=True)`.
+The window remains bounded at 120 seconds. An unsubmitted expired choice gets
+a new decision identity and freshly validated offers; old plans remain invalid.
+An issued command is never retried by this option. Defaults remain a 60-second
+maximum and the existing expiration policy.
